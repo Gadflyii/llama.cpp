@@ -8,33 +8,32 @@ The default behavior for CPU only operations is unchanged. When a GPU is present
 
 ## llama-bench
 ## No AMX
-'''
+
 numactl -N 2 -m 2 llama-bench -m /Qwen3-30B-A3B-Thinking-2507-Q4_0.gguf -t 32 --numa numactl -ngl 10 -nopo 1 -b 512 -ub 512 -pg 512,512 --repetitions 3
 ggml_cuda_init: GGML_CUDA_FORCE_MMQ:    no
 ggml_cuda_init: GGML_CUDA_FORCE_CUBLAS: no
 ggml_cuda_init: found 1 CUDA devices:
   Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes
+
 | model                          |       size |     params | backend    | ngl | threads | n_batch | nopo |            test |                  t/s |
 | ------------------------------ | ---------: | ---------: | ---------- | --: | ------: | ------: | ---: | --------------: | -------------------: |
 | qwen3moe 30B.A3B Q4_0          |  16.18 GiB |    30.53 B | CUDA       |  10 |      32 |     512 |    1 |           pp512 |        214.45 ± 0.11 |
 | qwen3moe 30B.A3B Q4_0          |  16.18 GiB |    30.53 B | CUDA       |  10 |      32 |     512 |    1 |           tg128 |         45.67 ± 0.03 |
 | qwen3moe 30B.A3B Q4_0          |  16.18 GiB |    30.53 B | CUDA       |  10 |      32 |     512 |    1 |     pp512+tg512 |         65.27 ± 0.13 |
-'''
 
 ## With AMX
 
-'''
 numactl -N 2 -m 2 llama-bench -m /Qwen3-30B-A3B-Thinking-2507-Q4_0.gguf -t 32 --numa numactl -ngl 10 --amx -nopo 1 -b 512 -ub 512 -pg 512,512 --repetitions 3
 ggml_cuda_init: GGML_CUDA_FORCE_MMQ:    no
 ggml_cuda_init: GGML_CUDA_FORCE_CUBLAS: no
 ggml_cuda_init: found 1 CUDA devices:
   Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes
+  
 | model                          |       size |     params | backend    | ngl | threads | n_batch |       amx | nopo |            test |                  t/s |
 | ------------------------------ | ---------: | ---------: | ---------- | --: | ------: | ------: | --------: | ---: | --------------: | -------------------: |
 | qwen3moe 30B.A3B Q4_0          |  16.18 GiB |    30.53 B | CUDA       |  10 |      32 |     512 |         1 |    1 |           pp512 |        284.08 ± 0.26 |
 | qwen3moe 30B.A3B Q4_0          |  16.18 GiB |    30.53 B | CUDA       |  10 |      32 |     512 |         1 |    1 |           tg128 |         55.55 ± 0.26 |
 | qwen3moe 30B.A3B Q4_0          |  16.18 GiB |    30.53 B | CUDA       |  10 |      32 |     512 |         1 |    1 |     pp512+tg512 |         77.62 ± 0.26 |
-'''
 
 ##PP512         + 69.62 t/s (+32.47%)
 ##TG128         + 9.88 t/s (+21.63%)
@@ -44,7 +43,6 @@ ggml_cuda_init: found 1 CUDA devices:
 
 ## No AMX
 
-'''
 numactl -N 2 -m 2 /llama-cli -m /Qwen3-30B-A3B-Thinking-2507-Q4_0.gguf -ngl 10 -t 32 -b 4096 -c 4096 -n 512 --numa numactl -p "10 facts about birds" -no-cnv
 
 llama_perf_sampler_print:    sampling time =      62.16 ms /   517 runs   (    0.12 ms per token,  8316.84 tokens per second)
@@ -53,11 +51,10 @@ llama_perf_context_print: prompt eval time =      58.17 ms /     5 tokens (   11
 llama_perf_context_print:        eval time =   12675.00 ms /   511 runs   (   24.80 ms per token,    40.32 tokens per second)
 llama_perf_context_print:       total time =   13012.05 ms /   516 tokens
 llama_perf_context_print:    graphs reused =        508
-'''
+
 
 ## With AMX
 
-'''
 numactl -N 2 -m 2 /llama-cli -m /Qwen3-30B-A3B-Thinking-2507-Q4_0.gguf -ngl 10 --amx -t 32 -b 4096 -c 4096 -n 512 --numa numactl -p "10 facts about birds" -no-cnv
 
 llama_perf_sampler_print:    sampling time =      56.16 ms /   517 runs   (    0.11 ms per token,  9205.18 tokens per second)
@@ -66,7 +63,6 @@ llama_perf_context_print: prompt eval time =      51.53 ms /     5 tokens (   10
 llama_perf_context_print:        eval time =   10416.81 ms /   511 runs   (   20.39 ms per token,    49.06 tokens per second)
 llama_perf_context_print:       total time =   10670.73 ms /   516 tokens
 llama_perf_context_print:    graphs reused =        508
-'''
 
 ## Decode (generation): +8.74 t/s (+21.68%)
 ## Prompt (prefill): +11.07 t/s (+12.88%)
@@ -82,28 +78,21 @@ Build with all the normal AMX flags (unchanged from upstream); then use the new 
 '''
 set -euo pipefail
 
-# 1) System packages (compiler toolchain, cmake, Ninja optional, perf tools, Python venv)
 sudo apt-get update
 sudo apt-get install -y \
   build-essential cmake ninja-build git pkg-config \
   python3-venv python3-pip python3-dev \
   linux-tools-common linux-tools-$(uname -r)
 
-# 2) Python virtual environment
 mkdir -p ~/venvs
 python3 -m venv ~/venvs/amxllama
 source ~/venvs/amxllama/bin/activate
 python -m pip install -U pip
 
-# 3) Clone this fork
 mkdir -p ~/src
 git clone https://github.com/Gadflyii/llama.cpp.git ~/src/amx-llama.cpp
 cd ~/src/amx-llama.cpp
 
-# 4) Configure CMake (AMX on, CUDA on)
-#    - GGML_NATIVE=ON      : enable host-specific CPU optimizations
-#    - GGML_CUDA=ON        : enable CUDA backend (requires CUDA/cuBLAS installed)
-#    - GGML_AMX_TILE/INT8/BF16=ON : enable AMX paths
 cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DGGML_NATIVE=ON \
@@ -112,11 +101,9 @@ cmake -S . -B build -G Ninja \
   -DGGML_AMX_INT8=ON \
   -DGGML_AMX_BF16=ON
 
-# 5) Build 
 cmake --build build -j"$(nproc)"
 '''
-## Example startup and benchmark commands (recommend you run with numactl and adjust thread count to match your numa node):
-
+# Example Commands
 '''
 # Bench (hybrid GPU+CPU AMX, no warmup)
 ./build/bin/llama-bench \
