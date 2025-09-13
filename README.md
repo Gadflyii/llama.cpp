@@ -6,7 +6,7 @@ The default behavior for CPU only operations is unchanged. When a GPU is present
 
 ## Intial testing results (Xeon 8592+):
 
-## llama-bench
+## llama-bench:
 ### No AMX
 ```
 numactl -N 2 -m 2 llama-bench -m /Qwen3-30B-A3B-Thinking-2507-Q4_0.gguf -t 32 --numa numactl -ngl 10 -nopo 1 -b 512 -ub 512 -pg 512,512 --repetitions 3
@@ -36,9 +36,9 @@ ggml_cuda_init: found 1 CUDA devices:
 | qwen3moe 30B.A3B Q4_0          |  16.18 GiB |    30.53 B | CUDA       |  10 |      32 |     512 |         1 |    1 |           tg128 |         55.55 ± 0.26 |
 | qwen3moe 30B.A3B Q4_0          |  16.18 GiB |    30.53 B | CUDA       |  10 |      32 |     512 |         1 |    1 |     pp512+tg512 |         77.62 ± 0.26 |
 ```
-**PP512         + 69.62 t/s (+32.47%)**
-**TG128         + 9.88 t/s (+21.63%)**
-**PP512+TG512   + 12.35 t/s (+18.92%)**
+- **PP512         + 69.62 t/s (+32.47%)**
+- **TG128         + 9.88 t/s (+21.63%)**
+- **PP512+TG512   + 12.35 t/s (+18.92%)**
 
 
 ## CLI performance:
@@ -66,9 +66,9 @@ llama_perf_context_print:        eval time =   10416.81 ms /   511 runs   (   20
 llama_perf_context_print:       total time =   10670.73 ms /   516 tokens
 llama_perf_context_print:    graphs reused =        508
 ```
-**Decode (generation): +8.74 t/s (+21.68%)**
-**Prompt (prefill): +11.07 t/s (+12.88%)**
-**Overall throughput: + 8.77 t/s (+21.64%)**
+- **Decode (generation): +8.74 t/s (+21.68%)**
+- **Prompt (prefill): +11.07 t/s (+12.88%)**
+- **Overall throughput: + 8.77 t/s (+21.64%)**
 
 
 ## Instructions:
