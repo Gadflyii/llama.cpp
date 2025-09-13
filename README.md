@@ -1,13 +1,13 @@
-## gadflyii/llama.cpp
+# gadflyii/llama.cpp
 
 This fork enables Intel AMX acceleration for 4th, 5th, and 6th generation Xeon / Xeon-w processors in CPU / GPU hybrids.  Upstream llama.cpp will disable AMX if a GPU is detected, slowing performance on offloaded CPU layers / experts.
 
 The default behavior for CPU only operations is unchanged. When a GPU is present, and the cli/server/bench is started with the "--amx" flag, the CPU's extra buffers are exposed and prefferred, thus enabling repack and use AMX acceleration on the CPU.
 
-# Intial testing results (Xeon 8592+):
+## Intial testing results (Xeon 8592+):
 
 ## llama-bench
-## No AMX
+### No AMX
 
 numactl -N 2 -m 2 llama-bench -m /Qwen3-30B-A3B-Thinking-2507-Q4_0.gguf -t 32 --numa numactl -ngl 10 -nopo 1 -b 512 -ub 512 -pg 512,512 --repetitions 3
 ggml_cuda_init: GGML_CUDA_FORCE_MMQ:    no
@@ -21,7 +21,7 @@ ggml_cuda_init: found 1 CUDA devices:
 | qwen3moe 30B.A3B Q4_0          |  16.18 GiB |    30.53 B | CUDA       |  10 |      32 |     512 |    1 |           tg128 |         45.67 ± 0.03 |
 | qwen3moe 30B.A3B Q4_0          |  16.18 GiB |    30.53 B | CUDA       |  10 |      32 |     512 |    1 |     pp512+tg512 |         65.27 ± 0.13 |
 
-## With AMX
+### With AMX
 
 numactl -N 2 -m 2 llama-bench -m /Qwen3-30B-A3B-Thinking-2507-Q4_0.gguf -t 32 --numa numactl -ngl 10 --amx -nopo 1 -b 512 -ub 512 -pg 512,512 --repetitions 3
 ggml_cuda_init: GGML_CUDA_FORCE_MMQ:    no
@@ -35,13 +35,13 @@ ggml_cuda_init: found 1 CUDA devices:
 | qwen3moe 30B.A3B Q4_0          |  16.18 GiB |    30.53 B | CUDA       |  10 |      32 |     512 |         1 |    1 |           tg128 |         55.55 ± 0.26 |
 | qwen3moe 30B.A3B Q4_0          |  16.18 GiB |    30.53 B | CUDA       |  10 |      32 |     512 |         1 |    1 |     pp512+tg512 |         77.62 ± 0.26 |
 
-## PP512         + 69.62 t/s (+32.47%)
-## TG128         + 9.88 t/s (+21.63%)
-## PP512+TG512   + 12.35 t/s (+18.92%)
+### PP512         + 69.62 t/s (+32.47%)
+### TG128         + 9.88 t/s (+21.63%)
+### PP512+TG512   + 12.35 t/s (+18.92%)
 
 ## CLI performance:
 
-## No AMX
+### No AMX
 
 numactl -N 2 -m 2 /llama-cli -m /Qwen3-30B-A3B-Thinking-2507-Q4_0.gguf -ngl 10 -t 32 -b 4096 -c 4096 -n 512 --numa numactl -p "10 facts about birds" -no-cnv
 
@@ -53,7 +53,7 @@ llama_perf_context_print:       total time =   13012.05 ms /   516 tokens
 llama_perf_context_print:    graphs reused =        508
 
 
-## With AMX
+### With AMX
 
 numactl -N 2 -m 2 /llama-cli -m /Qwen3-30B-A3B-Thinking-2507-Q4_0.gguf -ngl 10 --amx -t 32 -b 4096 -c 4096 -n 512 --numa numactl -p "10 facts about birds" -no-cnv
 
@@ -64,18 +64,18 @@ llama_perf_context_print:        eval time =   10416.81 ms /   511 runs   (   20
 llama_perf_context_print:       total time =   10670.73 ms /   516 tokens
 llama_perf_context_print:    graphs reused =        508
 
-## Decode (generation): +8.74 t/s (+21.68%)
-## Prompt (prefill): +11.07 t/s (+12.88%)
-## Overall throughput: + 8.77 t/s (+21.64%)
+### Decode (generation): +8.74 t/s (+21.68%)
+### Prompt (prefill): +11.07 t/s (+12.88%)
+### Overall throughput: + 8.77 t/s (+21.64%)
 
 
-# Instructions:
+## Instructions:
 
 Build with all the normal AMX flags (unchanged from upstream); then use the new varible "--amx" in your run commands. You can use "--amx" on all excutables, including llama-bench. 
 
-## Copy and paste pull and build (bash):
+## Copy and paste / pull and build (bash):
 
-'''
+```
 set -euo pipefail
 
 sudo apt-get update
@@ -102,9 +102,9 @@ cmake -S . -B build -G Ninja \
   -DGGML_AMX_BF16=ON
 
 cmake --build build -j"$(nproc)"
-'''
+```
 # Example Commands
-'''
+```
 # Bench (hybrid GPU+CPU AMX, no warmup)
 ./build/bin/llama-bench \
   --amx \
@@ -120,10 +120,11 @@ cmake --build build -j"$(nproc)"
 # Server (hybrid) – default port 8080
 ./build/bin/llama-server --amx \
   -m /path-to-your-model.gguf 
-'''
+```
 
 ## Thanks for helping me test!
 
+---
 
 # llama.cpp
 
