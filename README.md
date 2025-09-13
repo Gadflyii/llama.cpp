@@ -111,13 +111,13 @@ cmake --build build -j"$(nproc)"
 ./build/bin/llama-bench \
   --amx \
   -m /path-to-your-model.gguf \
-  -t 32 -ngl 10 -b 256 -ub 256 -pg 1024 --no-warmup
+  -t 32 -ngl 10 -nopo 1 -b 512 -ub 512 -pg 512,512 --repetitions 3
 
 # CLI (hybrid) quick generation
 ./build/bin/llama-cli \
   --amx \
   -m /path-to-your-model.gguf \
-  -t 32 -ngl 10 -c 4096 -n 64 -p "10 facts about birds" --no-warmup
+  -ngl 10 -t 32 -b 4096 -c 4096 -n 512 -p "10 facts about birds" -no-cnv
 
 # Server (hybrid) – default port 8080
 ./build/bin/llama-server --amx \
