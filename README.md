@@ -104,6 +104,7 @@ cmake -S . -B build -G Ninja \
   -DGGML_AMX_BF16=ON
 
 cmake --build build -j"$(nproc)"
+pip install intel-extension-for-pytorch
 ```
 ## Example Commands
 ```
