@@ -98,6 +98,17 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_link_libraries(${GGML_CPU_NAME} PUBLIC memkind)
     endif()
 
+    # Link against libnuma for NUMA mirror support on Linux
+    if (UNIX AND NOT APPLE)
+        find_library(NUMA_LIBRARY numa)
+        if (NUMA_LIBRARY)
+            message(STATUS "Found libnuma: ${NUMA_LIBRARY}")
+            target_link_libraries(${GGML_CPU_NAME} PUBLIC ${NUMA_LIBRARY})
+        else()
+            message(WARNING "libnuma not found - NUMA mirror mode will not be available")
+        endif()
+    endif()
+
     if (GGML_SYSTEM_ARCH STREQUAL "ARM")
         message(STATUS "ARM detected")
         list(APPEND GGML_CPU_SOURCES

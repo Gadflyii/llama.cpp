@@ -2138,6 +2138,227 @@ static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_from_ptr_i = {
     /* .reset           = */ NULL,
 };
 
+//
+// NUMA Mirror Buffer - replicates buffers across NUMA nodes
+//
+
+#if defined(__gnu_linux__)
+#include <numa.h>
+#include <numaif.h>
+#include "ggml-cpu.h"  // for ggml_numa_strategy enum
+
+#define GGML_NUMA_MAX_NODES 8
+
+struct ggml_numa_mirror_buffer {
+    uint32_t n_replicas;                        // number of active NUMA nodes
+    uint32_t active_nodes[GGML_NUMA_MAX_NODES]; // which nodes have replicas
+    void *   replicas[GGML_NUMA_MAX_NODES];     // pointer to each replica
+    size_t   size;                               // size of each replica
+};
+
+// Forward declarations for functions defined in ggml-cpu.c
+#ifdef __cplusplus
+extern "C" {
+#endif
+uint32_t ggml_get_active_numa_nodes(bool * active_nodes, uint32_t max_nodes);
+uint32_t ggml_get_current_numa_node(void);
+enum ggml_numa_strategy ggml_get_numa_strategy(void);
+#ifdef __cplusplus
+}
+#endif
+
+// Forward declaration for regular CPU buffer functions
+static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
+ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
+
+static void ggml_backend_cpu_mirror_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) buffer->context;
+
+    // Free all replicas
+    for (uint32_t i = 0; i < mirror->n_replicas; i++) {
+        uint32_t node = mirror->active_nodes[i];
+        if (mirror->replicas[node]) {
+            numa_free(mirror->replicas[node], mirror->size);
+        }
+    }
+
+    free(mirror);
+}
+
+static void * ggml_backend_cpu_mirror_buffer_get_base(ggml_backend_buffer_t buffer) {
+    struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) buffer->context;
+
+    // Return the replica for the current NUMA node, or the first one if not found
+    uint32_t current_node = ggml_get_current_numa_node();
+    if (mirror->replicas[current_node]) {
+        return mirror->replicas[current_node];
+    }
+
+    // Fallback to first replica
+    return mirror->replicas[mirror->active_nodes[0]];
+}
+
+static void ggml_backend_cpu_mirror_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
+                                                          uint8_t value, size_t offset, size_t size) {
+    struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) buffer->context;
+
+    // Memset all replicas
+    for (uint32_t i = 0; i < mirror->n_replicas; i++) {
+        uint32_t node = mirror->active_nodes[i];
+        void * replica_base = mirror->replicas[node];
+        memset((char *)replica_base + ((char *)tensor->data - (char *)mirror->replicas[mirror->active_nodes[0]]) + offset,
+               value, size);
+    }
+}
+
+static void ggml_backend_cpu_mirror_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
+                                                       const void * data, size_t offset, size_t size) {
+    struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) buffer->context;
+
+    // Calculate tensor offset within buffer
+    size_t tensor_offset = (char *)tensor->data - (char *)mirror->replicas[mirror->active_nodes[0]];
+
+    // Write to all replicas
+    for (uint32_t i = 0; i < mirror->n_replicas; i++) {
+        uint32_t node = mirror->active_nodes[i];
+        void * replica_ptr = (char *)mirror->replicas[node] + tensor_offset + offset;
+        memcpy(replica_ptr, data, size);
+    }
+}
+
+static void ggml_backend_cpu_mirror_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor,
+                                                       void * data, size_t offset, size_t size) {
+    struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) buffer->context;
+
+    // Read from local replica for best performance
+    uint32_t current_node = ggml_get_current_numa_node();
+    void * src_replica = mirror->replicas[current_node] ?
+                         mirror->replicas[current_node] :
+                         mirror->replicas[mirror->active_nodes[0]];
+
+    size_t tensor_offset = (char *)tensor->data - (char *)mirror->replicas[mirror->active_nodes[0]];
+    memcpy(data, (char *)src_replica + tensor_offset + offset, size);
+}
+
+static bool ggml_backend_cpu_mirror_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src,
+                                                       struct ggml_tensor * dst) {
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) buffer->context;
+        size_t tensor_offset = (char *)dst->data - (char *)mirror->replicas[mirror->active_nodes[0]];
+
+        // Copy to all replicas
+        for (uint32_t i = 0; i < mirror->n_replicas; i++) {
+            uint32_t node = mirror->active_nodes[i];
+            void * dst_replica = (char *)mirror->replicas[node] + tensor_offset;
+            memcpy(dst_replica, src->data, ggml_nbytes(src));
+        }
+        return true;
+    }
+    return false;
+}
+
+static void ggml_backend_cpu_mirror_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) buffer->context;
+
+    // Clear all replicas
+    for (uint32_t i = 0; i < mirror->n_replicas; i++) {
+        uint32_t node = mirror->active_nodes[i];
+        memset(mirror->replicas[node], value, mirror->size);
+    }
+}
+
+static const struct ggml_backend_buffer_i ggml_backend_cpu_mirror_buffer_i = {
+    /* .free_buffer     = */ ggml_backend_cpu_mirror_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_cpu_mirror_buffer_get_base,
+    /* .init_tensor     = */ NULL,
+    /* .memset_tensor   = */ ggml_backend_cpu_mirror_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_cpu_mirror_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cpu_mirror_buffer_get_tensor,
+    /* .cpy_tensor      = */ ggml_backend_cpu_mirror_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_cpu_mirror_buffer_clear,
+    /* .reset           = */ NULL,
+};
+
+// CPU Mirror buffer type
+static const char * ggml_backend_cpu_mirror_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    return "CPU_NUMA_Mirror";
+    GGML_UNUSED(buft);
+}
+
+static ggml_backend_buffer_t ggml_backend_cpu_mirror_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    // Detect active NUMA nodes from cpuset
+    bool active_nodes_mask[GGML_NUMA_MAX_NODES];
+    uint32_t n_active = ggml_get_active_numa_nodes(active_nodes_mask, GGML_NUMA_MAX_NODES);
+
+    if (n_active <= 1) {
+        // Only one node, fall back to regular allocation
+        GGML_LOG_WARN("%s: only one NUMA node active, using regular CPU buffer\n", __func__);
+        return ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+    }
+
+    // Allocate mirror structure
+    struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) calloc(1, sizeof(struct ggml_numa_mirror_buffer));
+    if (!mirror) {
+        GGML_LOG_ERROR("%s: failed to allocate mirror buffer structure\n", __func__);
+        return NULL;
+    }
+
+    mirror->size = size;
+    mirror->n_replicas = 0;
+
+    // Allocate replica on each active node
+    for (uint32_t node = 0; node < GGML_NUMA_MAX_NODES; node++) {
+        if (active_nodes_mask[node]) {
+            mirror->replicas[node] = numa_alloc_onnode(size, node);
+            if (!mirror->replicas[node]) {
+                GGML_LOG_ERROR("%s: failed to allocate %zu bytes on NUMA node %u\n", __func__, size, node);
+                // Free previously allocated replicas
+                for (uint32_t j = 0; j < node; j++) {
+                    if (mirror->replicas[j]) {
+                        numa_free(mirror->replicas[j], size);
+                    }
+                }
+                free(mirror);
+                return NULL;
+            }
+            mirror->active_nodes[mirror->n_replicas++] = node;
+            GGML_LOG_INFO("%s: allocated %zu bytes on NUMA node %u\n", __func__, size, node);
+        }
+    }
+
+    GGML_LOG_INFO("%s: created mirror buffer with %u replicas\n", __func__, mirror->n_replicas);
+
+    return ggml_backend_buffer_init(buft, ggml_backend_cpu_mirror_buffer_i, mirror, size);
+}
+
+static size_t ggml_backend_cpu_mirror_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    return TENSOR_ALIGNMENT;
+    GGML_UNUSED(buft);
+}
+
+static bool ggml_backend_cpu_mirror_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    return true;
+    GGML_UNUSED(buft);
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cpu_mirror_buffer_type(void) {
+    static struct ggml_backend_buffer_type ggml_backend_buffer_type_cpu_mirror = {
+        /* .iface   = */ {
+            /* .get_name         = */ ggml_backend_cpu_mirror_buffer_type_get_name,
+            /* .alloc_buffer     = */ ggml_backend_cpu_mirror_buffer_type_alloc_buffer,
+            /* .get_alignment    = */ ggml_backend_cpu_mirror_buffer_type_get_alignment,
+            /* .get_max_size     = */ NULL,
+            /* .get_alloc_size   = */ NULL,
+            /* .is_host          = */ ggml_backend_cpu_mirror_buffer_type_is_host,
+        },
+        /* .device  = */ NULL,
+        /* .context = */ NULL,
+    };
+
+    return &ggml_backend_buffer_type_cpu_mirror;
+}
+#endif // __gnu_linux__
+
 // CPU backend buffer type
 
 // this buffer type is defined here to make it available to all backends
@@ -2172,6 +2393,13 @@ static bool ggml_backend_cpu_buffer_type_is_host(ggml_backend_buffer_type_t buft
 }
 
 ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
+#if defined(__gnu_linux__)
+    // Check if NUMA mirror mode is active
+    if (ggml_get_numa_strategy() == GGML_NUMA_STRATEGY_MIRROR) {
+        return ggml_backend_cpu_mirror_buffer_type();
+    }
+#endif
+
     static struct ggml_backend_buffer_type ggml_backend_cpu_buffer_type = {
         /* .iface   = */ {
             /* .get_name         = */ ggml_backend_cpu_buffer_type_get_name,
