@@ -2370,6 +2370,13 @@ static const char * ggml_backend_cpu_buffer_type_get_name(ggml_backend_buffer_ty
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+#if defined(__gnu_linux__)
+    // Check if NUMA mirror mode is active at allocation time
+    if (ggml_get_numa_strategy() == GGML_NUMA_STRATEGY_MIRROR) {
+        return ggml_backend_cpu_mirror_buffer_type_alloc_buffer(buft, size);
+    }
+#endif
+
     void * data = ggml_aligned_malloc(size);
 
     if (data == NULL) {
@@ -2393,13 +2400,8 @@ static bool ggml_backend_cpu_buffer_type_is_host(ggml_backend_buffer_type_t buft
 }
 
 ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
-#if defined(__gnu_linux__)
-    // Check if NUMA mirror mode is active
-    if (ggml_get_numa_strategy() == GGML_NUMA_STRATEGY_MIRROR) {
-        return ggml_backend_cpu_mirror_buffer_type();
-    }
-#endif
-
+    // Note: NUMA mirror mode check is now done at allocation time in
+    // ggml_backend_cpu_buffer_type_alloc_buffer(), not here
     static struct ggml_backend_buffer_type ggml_backend_cpu_buffer_type = {
         /* .iface   = */ {
             /* .get_name         = */ ggml_backend_cpu_buffer_type_get_name,

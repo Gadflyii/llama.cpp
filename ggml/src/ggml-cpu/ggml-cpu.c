@@ -688,12 +688,18 @@ bool ggml_is_numa(void) {
 // Made non-static for use in ggml-backend.cpp
 uint32_t ggml_get_active_numa_nodes(bool * active_nodes, uint32_t max_nodes) {
     uint32_t n_active = 0;
-    cpu_set_t cpuset = g_state.numa.cpuset;
 
     // Initialize all to false
     for (uint32_t i = 0; i < max_nodes; i++) {
         active_nodes[i] = false;
     }
+
+    // If NUMA not initialized yet, return 0
+    if (g_state.numa.n_nodes == 0) {
+        return 0;
+    }
+
+    cpu_set_t cpuset = g_state.numa.cpuset;
 
     // Check which nodes have CPUs in the cpuset
     for (uint32_t node = 0; node < g_state.numa.n_nodes && node < max_nodes; node++) {
