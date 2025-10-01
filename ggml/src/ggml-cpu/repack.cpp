@@ -1887,6 +1887,7 @@ struct ggml_numa_mirror_buffer {
     void *   replicas[GGML_NUMA_MAX_NODES];
     size_t   size;
     void *   original_base;
+    bool     read_only;
 };
 #endif
 
@@ -1902,8 +1903,9 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     if (buffer->context) {
         struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) buffer->context;
         // Verify magic number to ensure this is actually a mirror buffer
-        if (mirror->magic == GGML_MIRROR_BUFFER_MAGIC && mirror->n_replicas > 1) {
-            // This is a mirror buffer - repack to each replica
+        // Only replicate if this is a read-only buffer (model weights)
+        if (mirror->magic == GGML_MIRROR_BUFFER_MAGIC && mirror->n_replicas > 1 && mirror->read_only) {
+            // This is a read-only mirror buffer - repack to each replica
             // Get the buffer base which is the first replica
             void * buffer_base = mirror->original_base ? mirror->original_base : mirror->replicas[mirror->active_nodes[0]];
             size_t tensor_offset = (char *)tensor->data - (char *)buffer_base;

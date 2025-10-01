@@ -2158,6 +2158,7 @@ struct ggml_numa_mirror_buffer {
     void *   replicas[GGML_NUMA_MAX_NODES];     // pointer to each replica
     size_t   size;                               // size of each replica
     void *   original_base;                      // original mmap base (for CPU_Mapped buffers), NULL for regular buffers
+    bool     read_only;                          // true for model buffers (written once), false for runtime buffers (KV cache, output)
 };
 
 // NUMA helper functions - weak defaults that can be overridden by ggml-cpu.c
@@ -2331,6 +2332,7 @@ static ggml_backend_buffer_t ggml_backend_cpu_mirror_buffer_type_alloc_buffer(gg
     mirror->magic = GGML_MIRROR_BUFFER_MAGIC;  // Set magic number for identification
     mirror->size = size;
     mirror->n_replicas = 0;
+    mirror->read_only = true;  // Model weight buffers are read-only (written once at load, never modified during inference)
 
     // Allocate replica on each active node
     for (uint32_t node = 0; node < GGML_NUMA_MAX_NODES; node++) {
@@ -2422,13 +2424,9 @@ static const char * ggml_backend_cpu_buffer_type_get_name(ggml_backend_buffer_ty
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-#if defined(__gnu_linux__)
-    // Check if NUMA mirror mode is active at allocation time
-    if (ggml_get_numa_strategy() == GGML_NUMA_STRATEGY_MIRROR) {
-        return ggml_backend_cpu_mirror_buffer_type_alloc_buffer(buft, size);
-    }
-#endif
-
+    // Note: NUMA mirror mode is NOT checked here
+    // Only specific buffer types (REPACK, AMX) should allocate mirror buffers
+    // Runtime buffers (CPU output, KV cache) should use regular allocation
     void * data = ggml_aligned_malloc(size);
 
     if (data == NULL) {
