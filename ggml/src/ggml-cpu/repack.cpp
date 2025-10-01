@@ -1876,14 +1876,58 @@ static enum ggml_status ggml_backend_cpu_repack_buffer_init_tensor(ggml_backend_
     return GGML_STATUS_SUCCESS;
 }
 
+// Forward declare mirror buffer structure for NUMA replication
+#if defined(__gnu_linux__)
+#define GGML_NUMA_MAX_NODES 8
+#define GGML_MIRROR_BUFFER_MAGIC 0x4D49524E  // "MIRN" in hex
+struct ggml_numa_mirror_buffer {
+    uint32_t magic;
+    uint32_t n_replicas;
+    uint32_t active_nodes[GGML_NUMA_MAX_NODES];
+    void *   replicas[GGML_NUMA_MAX_NODES];
+    size_t   size;
+    void *   original_base;
+};
+#endif
+
 static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                                                        const void * data, size_t offset, size_t size) {
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(size == ggml_nbytes(tensor));
 
     auto tensor_traits = (ggml::cpu::repack::tensor_traits_base *) tensor->extra;
-    auto OK            = tensor_traits->repack(tensor, data, size);
 
+#if defined(__gnu_linux__)
+    // Check if this is a mirror buffer using magic number
+    if (buffer->context) {
+        struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) buffer->context;
+        // Verify magic number to ensure this is actually a mirror buffer
+        if (mirror->magic == GGML_MIRROR_BUFFER_MAGIC && mirror->n_replicas > 1) {
+            // This is a mirror buffer - repack to each replica
+            // Get the buffer base which is the first replica
+            void * buffer_base = mirror->original_base ? mirror->original_base : mirror->replicas[mirror->active_nodes[0]];
+            size_t tensor_offset = (char *)tensor->data - (char *)buffer_base;
+
+            for (uint32_t i = 0; i < mirror->n_replicas; i++) {
+                uint32_t node = mirror->active_nodes[i];
+                // Temporarily update tensor->data to point to this replica
+                void * original_data = tensor->data;
+                tensor->data = (char *)mirror->replicas[node] + tensor_offset;
+
+                // Repack to this replica
+                auto OK = tensor_traits->repack(tensor, data, size);
+                GGML_ASSERT(OK == 0);
+
+                // Restore original pointer
+                tensor->data = original_data;
+            }
+            return;
+        }
+    }
+#endif
+
+    // Regular (non-mirror) buffer - repack once
+    auto OK = tensor_traits->repack(tensor, data, size);
     GGML_ASSERT(OK == 0);
     GGML_UNUSED(buffer);
 }
@@ -1894,7 +1938,32 @@ static const char * ggml_backend_cpu_repack_buffer_type_get_name(ggml_backend_bu
     GGML_UNUSED(buft);
 }
 
+#if defined(__gnu_linux__)
+// Forward declaration for NUMA mirror support
+extern "C" enum ggml_numa_strategy ggml_get_numa_strategy(void);
+#endif
+
 static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+#if defined(__gnu_linux__)
+    // Check if NUMA mirror mode is active at allocation time
+    if (ggml_get_numa_strategy() == GGML_NUMA_STRATEGY_MIRROR) {
+        // Need to allocate mirror buffer and wrap it with REPACK interface
+        // For now, delegate directly to CPU buffer type which will create mirror
+        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+
+        if (buffer == nullptr) {
+            return nullptr;
+        }
+
+        buffer->buft              = buft;
+        buffer->iface.init_tensor = ggml_backend_cpu_repack_buffer_init_tensor;
+        buffer->iface.set_tensor  = ggml_backend_cpu_repack_buffer_set_tensor;
+        buffer->iface.get_tensor  = nullptr;
+        buffer->iface.cpy_tensor  = nullptr;
+        return buffer;
+    }
+#endif
+
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
 
     if (buffer == nullptr) {

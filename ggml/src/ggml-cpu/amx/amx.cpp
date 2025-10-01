@@ -64,8 +64,56 @@ static void ggml_backend_amx_buffer_memset_tensor(ggml_backend_buffer_t buffer, 
     GGML_UNUSED(buffer);
 }
 
+// Forward declare mirror buffer structure for NUMA replication
+#if defined(__linux__)
+#define GGML_NUMA_MAX_NODES 8
+#define GGML_MIRROR_BUFFER_MAGIC 0x4D49524E  // "MIRN" in hex
+struct ggml_numa_mirror_buffer {
+    uint32_t magic;                             // magic number for reliable identification
+    uint32_t n_replicas;
+    uint32_t active_nodes[GGML_NUMA_MAX_NODES];
+    void *   replicas[GGML_NUMA_MAX_NODES];
+    size_t   size;
+    void *   original_base;
+};
+#endif
+
 static void ggml_backend_amx_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                                                const void * data, size_t offset, size_t size) {
+#if defined(__linux__)
+    // Check if this is a mirror buffer using magic number
+    if (buffer->context) {
+        struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) buffer->context;
+        // Verify magic number to ensure this is actually a mirror buffer
+        if (mirror->magic == GGML_MIRROR_BUFFER_MAGIC && mirror->n_replicas > 1) {
+            // This is a mirror buffer - replicate to all nodes
+            // Get the buffer base which is the first replica
+            void * buffer_base = mirror->original_base ? mirror->original_base : mirror->replicas[mirror->active_nodes[0]];
+            size_t tensor_offset = (char *)tensor->data - (char *)buffer_base;
+
+            for (uint32_t i = 0; i < mirror->n_replicas; i++) {
+                uint32_t node = mirror->active_nodes[i];
+                // Temporarily update tensor->data to point to this replica
+                void * original_data = tensor->data;
+                tensor->data = (char *)mirror->replicas[node] + tensor_offset;
+
+                // Convert/copy to this replica
+                if (qtype_has_amx_kernels(tensor->type)) {
+                    GGML_LOG_DEBUG("%s: amx repack tensor %s to node %u\n", __func__, tensor->name, node);
+                    ggml_backend_amx_convert_weight(tensor, data, offset, size);
+                } else {
+                    memcpy((char *) tensor->data + offset, data, size);
+                }
+
+                // Restore original pointer
+                tensor->data = original_data;
+            }
+            return;
+        }
+    }
+#endif
+
+    // Regular (non-mirror) buffer
     if (qtype_has_amx_kernels(tensor->type)) {
         GGML_LOG_DEBUG("%s: amx repack tensor %s of type %s\n", __func__, tensor->name, ggml_type_name(tensor->type));
         ggml_backend_amx_convert_weight(tensor, data, offset, size);
@@ -122,7 +170,35 @@ static const char * ggml_backend_amx_buffer_type_get_name(ggml_backend_buffer_ty
     GGML_UNUSED(buft);
 }
 
+#if defined(__linux__)
+// Forward declaration for NUMA mirror support
+extern "C" enum ggml_numa_strategy ggml_get_numa_strategy(void);
+#endif
+
 static ggml_backend_buffer_t ggml_backend_amx_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+#if defined(__linux__)
+    // Check if NUMA mirror mode is active at allocation time
+    if (ggml_get_numa_strategy() == GGML_NUMA_STRATEGY_MIRROR) {
+        // Need to allocate mirror buffer and wrap it with AMX interface
+        // Delegate to CPU buffer type which will create mirror
+        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+
+        if (buffer == nullptr) {
+            return nullptr;
+        }
+
+        // Override the buffer type to report as AMX
+        buffer->buft = buft;
+
+        // CRITICAL: Override init_tensor to set AMX traits so AMX kernels are used
+        // Without this, tensors won't have AMX traits and will fall back to regular CPU ops
+        buffer->iface.init_tensor = ggml_backend_amx_buffer_init_tensor;
+        buffer->iface.set_tensor = ggml_backend_amx_buffer_set_tensor;
+
+        return buffer;
+    }
+#endif
+
     void * data = ggml_aligned_malloc(size);
     if (data == NULL) {
         fprintf(stderr, "%s: failed to allocate buffer of size %zu\n", __func__, size);

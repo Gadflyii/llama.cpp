@@ -1847,6 +1847,7 @@ enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct 
     GGML_ASSERT(tensor->data == NULL);
     GGML_ASSERT(tensor->view_src == NULL);
     GGML_ASSERT(addr >= ggml_backend_buffer_get_base(buffer));
+
     GGML_ASSERT((char *)addr + ggml_backend_buffer_get_alloc_size(buffer, tensor) <=
                 (char *)ggml_backend_buffer_get_base(buffer) + ggml_backend_buffer_get_size(buffer));
 
@@ -2148,24 +2149,40 @@ static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_from_ptr_i = {
 #include "ggml-cpu.h"  // for ggml_numa_strategy enum
 
 #define GGML_NUMA_MAX_NODES 8
+#define GGML_MIRROR_BUFFER_MAGIC 0x4D49524E  // "MIRN" in hex - magic number for identification
 
 struct ggml_numa_mirror_buffer {
+    uint32_t magic;                             // magic number for reliable identification
     uint32_t n_replicas;                        // number of active NUMA nodes
     uint32_t active_nodes[GGML_NUMA_MAX_NODES]; // which nodes have replicas
     void *   replicas[GGML_NUMA_MAX_NODES];     // pointer to each replica
     size_t   size;                               // size of each replica
+    void *   original_base;                      // original mmap base (for CPU_Mapped buffers), NULL for regular buffers
 };
 
-// Forward declarations for functions defined in ggml-cpu.c
-#ifdef __cplusplus
+// NUMA helper functions - weak defaults that can be overridden by ggml-cpu.c
+// When ggml-cpu is linked, its strong symbols will override these defaults
+#if defined(__GNUC__) || defined(__clang__)
+    #define GGML_WEAK_SYMBOL __attribute__((weak))
+#else
+    #define GGML_WEAK_SYMBOL
+#endif
+
 extern "C" {
-#endif
-uint32_t ggml_get_active_numa_nodes(bool * active_nodes, uint32_t max_nodes);
-uint32_t ggml_get_current_numa_node(void);
-enum ggml_numa_strategy ggml_get_numa_strategy(void);
-#ifdef __cplusplus
+    // Weak default implementations (used when ggml-cpu is not linked)
+    GGML_WEAK_SYMBOL uint32_t ggml_get_active_numa_nodes(bool * active_nodes, uint32_t max_nodes) {
+        (void)active_nodes; (void)max_nodes;
+        return 0; // No NUMA nodes detected
+    }
+
+    GGML_WEAK_SYMBOL uint32_t ggml_get_current_numa_node(void) {
+        return 0; // Default to node 0
+    }
+
+    GGML_WEAK_SYMBOL enum ggml_numa_strategy ggml_get_numa_strategy(void) {
+        return GGML_NUMA_STRATEGY_DISABLED; // NUMA disabled by default
+    }
 }
-#endif
 
 // Forward declaration for regular CPU buffer functions
 static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
@@ -2188,26 +2205,25 @@ static void ggml_backend_cpu_mirror_buffer_free_buffer(ggml_backend_buffer_t buf
 static void * ggml_backend_cpu_mirror_buffer_get_base(ggml_backend_buffer_t buffer) {
     struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) buffer->context;
 
-    // Return the replica for the current NUMA node, or the first one if not found
-    uint32_t current_node = ggml_get_current_numa_node();
-    if (mirror->replicas[current_node]) {
-        return mirror->replicas[current_node];
-    }
-
-    // Fallback to first replica
-    return mirror->replicas[mirror->active_nodes[0]];
+    // For CPU_Mapped buffers (created from mmap), return the original base
+    // because tensor addresses are calculated from the original mmap location
+    // For regular buffers, return the first replica
+    return mirror->original_base ? mirror->original_base : mirror->replicas[mirror->active_nodes[0]];
 }
 
 static void ggml_backend_cpu_mirror_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                                                           uint8_t value, size_t offset, size_t size) {
     struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) buffer->context;
 
+    // Calculate tensor offset
+    void * base_for_offset = mirror->original_base ? mirror->original_base : mirror->replicas[mirror->active_nodes[0]];
+    size_t tensor_offset = (char *)tensor->data - (char *)base_for_offset;
+
     // Memset all replicas
     for (uint32_t i = 0; i < mirror->n_replicas; i++) {
         uint32_t node = mirror->active_nodes[i];
         void * replica_base = mirror->replicas[node];
-        memset((char *)replica_base + ((char *)tensor->data - (char *)mirror->replicas[mirror->active_nodes[0]]) + offset,
-               value, size);
+        memset((char *)replica_base + tensor_offset + offset, value, size);
     }
 }
 
@@ -2216,7 +2232,10 @@ static void ggml_backend_cpu_mirror_buffer_set_tensor(ggml_backend_buffer_t buff
     struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) buffer->context;
 
     // Calculate tensor offset within buffer
-    size_t tensor_offset = (char *)tensor->data - (char *)mirror->replicas[mirror->active_nodes[0]];
+    // For CPU_Mapped buffers, tensor->data points to original mmap location
+    // For regular buffers, tensor->data points to first replica
+    void * base_for_offset = mirror->original_base ? mirror->original_base : mirror->replicas[mirror->active_nodes[0]];
+    size_t tensor_offset = (char *)tensor->data - (char *)base_for_offset;
 
     // Write to all replicas
     for (uint32_t i = 0; i < mirror->n_replicas; i++) {
@@ -2236,7 +2255,10 @@ static void ggml_backend_cpu_mirror_buffer_get_tensor(ggml_backend_buffer_t buff
                          mirror->replicas[current_node] :
                          mirror->replicas[mirror->active_nodes[0]];
 
-    size_t tensor_offset = (char *)tensor->data - (char *)mirror->replicas[mirror->active_nodes[0]];
+    // Calculate tensor offset (same logic as set_tensor)
+    void * base_for_offset = mirror->original_base ? mirror->original_base : mirror->replicas[mirror->active_nodes[0]];
+    size_t tensor_offset = (char *)tensor->data - (char *)base_for_offset;
+
     memcpy(data, (char *)src_replica + tensor_offset + offset, size);
 }
 
@@ -2244,7 +2266,10 @@ static bool ggml_backend_cpu_mirror_buffer_cpy_tensor(ggml_backend_buffer_t buff
                                                        struct ggml_tensor * dst) {
     if (ggml_backend_buffer_is_host(src->buffer)) {
         struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) buffer->context;
-        size_t tensor_offset = (char *)dst->data - (char *)mirror->replicas[mirror->active_nodes[0]];
+
+        // Calculate dst tensor offset
+        void * base_for_offset = mirror->original_base ? mirror->original_base : mirror->replicas[mirror->active_nodes[0]];
+        size_t tensor_offset = (char *)dst->data - (char *)base_for_offset;
 
         // Copy to all replicas
         for (uint32_t i = 0; i < mirror->n_replicas; i++) {
@@ -2303,6 +2328,7 @@ static ggml_backend_buffer_t ggml_backend_cpu_mirror_buffer_type_alloc_buffer(gg
         return NULL;
     }
 
+    mirror->magic = GGML_MIRROR_BUFFER_MAGIC;  // Set magic number for identification
     mirror->size = size;
     mirror->n_replicas = 0;
 
@@ -2356,6 +2382,32 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_mirror_buffer_type(void) {
     };
 
     return &ggml_backend_buffer_type_cpu_mirror;
+}
+
+// Helper function to check if mirror mode is active and return appropriate buffer
+// This should be called by delegating buffer types (REPACK, AMX) instead of directly
+// allocating from CPU buffer type
+static ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr_with_mirror_check(void * ptr, size_t size) {
+    // Check if NUMA mirror mode is active
+    if (ggml_get_numa_strategy() == GGML_NUMA_STRATEGY_MIRROR) {
+        // Allocate a mirror buffer
+        ggml_backend_buffer_t mirror_buffer = ggml_backend_cpu_mirror_buffer_type_alloc_buffer(
+            ggml_backend_cpu_mirror_buffer_type(), size);
+
+        // If we have a source pointer, copy data to all replicas
+        if (mirror_buffer && ptr) {
+            struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) mirror_buffer->context;
+            for (uint32_t i = 0; i < mirror->n_replicas; i++) {
+                uint32_t node = mirror->active_nodes[i];
+                memcpy(mirror->replicas[node], ptr, size);
+            }
+        }
+
+        return mirror_buffer;
+    }
+
+    // Regular CPU buffer
+    return NULL; // Signal that caller should use regular allocation
 }
 #endif // __gnu_linux__
 
@@ -2443,5 +2495,11 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
 
 ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) {
     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
+
+    // Note: CPU_Mapped buffers (from mmap) are NOT mirrored
+    // Mirroring mmap'd memory is complex because tensor->data pointers would need to be
+    // updated per-thread to point to local replicas. Instead, we rely on NUMA's automatic
+    // page migration for mmap'd model weights, and only mirror REPACK and AMX buffers.
+
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
 }
