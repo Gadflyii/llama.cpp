@@ -2046,11 +2046,7 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
     static thread_local int8_t Tile23[TILE_M * TILE_K];
 
     static thread_local int32_t TileC0[TILE_M * TILE_N * 4];
-    static thread_local int32_t TileC1[TILE_M * TILE_N * 4];
-
-    // double buffering C to interleave avx512 and amx
-    int32_t * C_cur = TileC0;
-    int32_t * C_pre = TileC1;
+    // Note: TileC1 removed - double buffering no longer needed with batched operations
 
     auto Tile4 = [&](int32_t * base) { return base; };
     auto Tile5 = [&](int32_t * base) { return base + TILE_M * TILE_N; };
@@ -2058,118 +2054,76 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
     auto Tile7 = [&](int32_t * base) { return base + 3 * TILE_M * TILE_N; };
 
     if (M == 2 * TILE_M) {
-        // i = 0
-        const char * B_blk0 = B + PACKED_INDEX(0, 0, KB, TILE_SIZE);
-        const char * B_blk1 = B + PACKED_INDEX(1, 0, KB, TILE_SIZE);
-        if (need_unpack) {
-            unpack_B<TB>(Tile0, B_blk0);
-            _tile_loadd(TMM0, Tile0, TILE_N * VNNI_BLK);
-        } else {
-            _tile_loadd(TMM0, B_blk0, TILE_N * VNNI_BLK);
-        }
+        // Optimized path: batch AMX operations, remove double buffering
+        // Process each K-block with: load → zero → compute → store → dequant
+        // This improves AMX instruction pipelining by batching similar operations
 
-        _tile_zero(TMM4);
-        _tile_loadd(TMM2, A[0].qs, lda);
-        _tile_dpbssd(TMM4, TMM2, TMM0);
-        _tile_stored(TMM4, Tile4(C_pre), TILE_N * sizeof(int32_t));
-
-        _tile_zero(TMM5);
-        _tile_loadd(TMM3, A[TILE_M * KB + 0].qs, lda);
-        _tile_dpbssd(TMM5, TMM3, TMM0);
-        _tile_stored(TMM5, Tile5(C_pre), TILE_N * sizeof(int32_t));
-
-        if (need_unpack) {
-            unpack_B<TB>(Tile1, B_blk0);
-            _tile_loadd(TMM1, Tile1, TILE_N * VNNI_BLK);
-        } else {
-            _tile_loadd(TMM1, B_blk1, TILE_N * VNNI_BLK);
-        }
-
-        _tile_zero(TMM6);
-        _tile_dpbssd(TMM6, TMM2, TMM1);
-        _tile_stored(TMM6, Tile6(C_pre), TILE_N * sizeof(int32_t));
-
-        _tile_zero(TMM7);
-        _tile_dpbssd(TMM7, TMM3, TMM1);
-        _tile_stored(TMM7, Tile7(C_pre), TILE_N * sizeof(int32_t));
-
-        for (int i = 1; i < KB; ++i) {
-            // index of previous iter
-            const int ii = i - 1;
-            const char * B_blk0 = B + PACKED_INDEX(0, i, KB, TILE_SIZE);
-            const char * B_blk1 = B + PACKED_INDEX(1, i, KB, TILE_SIZE);
-            GGML_DISPATCH_BOOL(ii > 0, is_acc, [&] {
-                if (need_unpack) {
-                    unpack_B<TB>(Tile0, B_blk0);
-                    _tile_loadd(TMM0, Tile0, TILE_N * VNNI_BLK);
-                } else {
-                    _tile_loadd(TMM0, B_blk0, TILE_N * VNNI_BLK);
-                }
-                _tile_zero(TMM4);
-                _tile_loadd(TMM2, A[i].qs, lda);
-                acc_C<TA, TB, is_acc>::apply(C, ldc, Tile4(C_pre), &A[ii], KB, B + PACKED_INDEX(0, ii, KB, TILE_SIZE), TILE_M);
-
-                _tile_dpbssd(TMM4, TMM2, TMM0);
-                _tile_stored(TMM4, Tile4(C_cur), TILE_N * sizeof(int32_t));
-
-                _tile_zero(TMM5);
-                _tile_loadd(TMM3, A[TILE_M * KB + i].qs, lda);
-                acc_C<TA, TB, is_acc>::apply(C + TILE_M * ldc, ldc, Tile5(C_pre), &A[TILE_M * KB + ii], KB, B + PACKED_INDEX(0, ii, KB, TILE_SIZE), TILE_M);
-
-                _tile_dpbssd(TMM5, TMM3, TMM0);
-                _tile_stored(TMM5, Tile5(C_cur), TILE_N * sizeof(int32_t));
-
-                if (need_unpack) {
-                    unpack_B<TB>(Tile1, B_blk1);
-                    _tile_loadd(TMM1, Tile1, TILE_N * VNNI_BLK);
-                } else {
-                    _tile_loadd(TMM1, B_blk1, TILE_N * VNNI_BLK);
-                }
-                _tile_zero(TMM6);
-                acc_C<TA, TB, is_acc>::apply(C + TILE_N, ldc, Tile6(C_pre), &A[ii], KB, B + PACKED_INDEX(1, ii, KB, TILE_SIZE), TILE_M);
-
-                _tile_dpbssd(TMM6, TMM2, TMM1);
-                _tile_stored(TMM6, Tile6(C_cur), TILE_N * sizeof(int32_t));
-
-                _tile_zero(TMM7);
-                acc_C<TA, TB, is_acc>::apply(C + TILE_M * ldc + TILE_N, ldc, Tile7(C_pre), &A[TILE_M * KB + ii], KB, B + PACKED_INDEX(1, ii, KB, TILE_SIZE), TILE_M);
-
-                _tile_dpbssd(TMM7, TMM3, TMM1);
-                _tile_stored(TMM7, Tile7(C_cur), TILE_N * sizeof(int32_t));
-
-                std::swap(C_cur, C_pre);
-            });
-        }
-        // final accumulation
-        {
-            int ii = KB - 1;
-            acc_C<TA, TB, true>::apply(C, ldc, Tile4(C_pre), &A[ii], KB, B + PACKED_INDEX(0, ii, KB, TILE_SIZE), TILE_M);
-            acc_C<TA, TB, true>::apply(C + TILE_M * ldc, ldc, Tile5(C_pre), &A[TILE_M * KB + ii], KB, B + PACKED_INDEX(0, ii, KB, TILE_SIZE), TILE_M);
-            acc_C<TA, TB, true>::apply(C + TILE_N, ldc, Tile6(C_pre), &A[ii], KB, B + PACKED_INDEX(1, ii, KB, TILE_SIZE), TILE_M);
-            acc_C<TA, TB, true>::apply(C + TILE_M * ldc + TILE_N, ldc, Tile7(C_pre), &A[TILE_M * KB + ii], KB, B + PACKED_INDEX(1, ii, KB, TILE_SIZE), TILE_M);
-        }
-    } else {
         for (int i = 0; i < KB; ++i) {
-            _tile_zero(TMM4);
-            _tile_zero(TMM6);
-            if (m1 != 0) {
-                _tile_zero(TMM5);
-                _tile_zero(TMM7);
-            }
-
             const char * B_blk0 = B + PACKED_INDEX(0, i, KB, TILE_SIZE);
             const char * B_blk1 = B + PACKED_INDEX(1, i, KB, TILE_SIZE);
+
+            // === Phase 1: Load all inputs (batch for better memory pipelining) ===
             if (need_unpack) {
                 unpack_B<TB>(Tile0, B_blk0);
-                _tile_loadd(TMM0, Tile0, TILE_N * VNNI_BLK);
-            } else {
-                _tile_loadd(TMM0, B_blk0, TILE_N * VNNI_BLK);
-            }
-
-            if (need_unpack) {
                 unpack_B<TB>(Tile1, B_blk1);
+                _tile_loadd(TMM0, Tile0, TILE_N * VNNI_BLK);
                 _tile_loadd(TMM1, Tile1, TILE_N * VNNI_BLK);
             } else {
+                _tile_loadd(TMM0, B_blk0, TILE_N * VNNI_BLK);
+                _tile_loadd(TMM1, B_blk1, TILE_N * VNNI_BLK);
+            }
+            _tile_loadd(TMM2, A[i].qs, lda);
+            _tile_loadd(TMM3, A[TILE_M * KB + i].qs, lda);
+
+            // === Phase 2: Zero all accumulator tiles (batch) ===
+            _tile_zero(TMM4);
+            _tile_zero(TMM5);
+            _tile_zero(TMM6);
+            _tile_zero(TMM7);
+
+            // === Phase 3: Compute all tile products (batch AMX operations) ===
+            _tile_dpbssd(TMM4, TMM2, TMM0);  // C[0,0] = A[0] @ B[0]
+            _tile_dpbssd(TMM5, TMM3, TMM0);  // C[1,0] = A[1] @ B[0]
+            _tile_dpbssd(TMM6, TMM2, TMM1);  // C[0,1] = A[0] @ B[1]
+            _tile_dpbssd(TMM7, TMM3, TMM1);  // C[1,1] = A[1] @ B[1]
+
+            // === Phase 4: Store all tiles (batch) ===
+            _tile_stored(TMM4, Tile4(TileC0), TILE_N * sizeof(int32_t));
+            _tile_stored(TMM5, Tile5(TileC0), TILE_N * sizeof(int32_t));
+            _tile_stored(TMM6, Tile6(TileC0), TILE_N * sizeof(int32_t));
+            _tile_stored(TMM7, Tile7(TileC0), TILE_N * sizeof(int32_t));
+
+            // === Phase 5: Dequantize and accumulate (batch AVX512 operations) ===
+            // Compile-time constant for is_acc: i==0 uses false, i>0 uses true
+            const bool is_acc = (i > 0);
+            if (is_acc) {
+                acc_C<TA, TB, true>::apply(C,                          ldc, Tile4(TileC0), &A[i], KB, B_blk0, TILE_M);
+                acc_C<TA, TB, true>::apply(C + TILE_M * ldc,           ldc, Tile5(TileC0), &A[TILE_M * KB + i], KB, B_blk0, TILE_M);
+                acc_C<TA, TB, true>::apply(C + TILE_N,                 ldc, Tile6(TileC0), &A[i], KB, B_blk1, TILE_M);
+                acc_C<TA, TB, true>::apply(C + TILE_M * ldc + TILE_N,  ldc, Tile7(TileC0), &A[TILE_M * KB + i], KB, B_blk1, TILE_M);
+            } else {
+                acc_C<TA, TB, false>::apply(C,                          ldc, Tile4(TileC0), &A[i], KB, B_blk0, TILE_M);
+                acc_C<TA, TB, false>::apply(C + TILE_M * ldc,           ldc, Tile5(TileC0), &A[TILE_M * KB + i], KB, B_blk0, TILE_M);
+                acc_C<TA, TB, false>::apply(C + TILE_N,                 ldc, Tile6(TileC0), &A[i], KB, B_blk1, TILE_M);
+                acc_C<TA, TB, false>::apply(C + TILE_M * ldc + TILE_N,  ldc, Tile7(TileC0), &A[TILE_M * KB + i], KB, B_blk1, TILE_M);
+            }
+        }
+    } else {
+        // Optimized fallback path for M < 2*TILE_M
+        // Same batching strategy as main path, with handling for partial tiles
+
+        for (int i = 0; i < KB; ++i) {
+            const char * B_blk0 = B + PACKED_INDEX(0, i, KB, TILE_SIZE);
+            const char * B_blk1 = B + PACKED_INDEX(1, i, KB, TILE_SIZE);
+
+            // === Phase 1: Load all inputs (batch) ===
+            if (need_unpack) {
+                unpack_B<TB>(Tile0, B_blk0);
+                unpack_B<TB>(Tile1, B_blk1);
+                _tile_loadd(TMM0, Tile0, TILE_N * VNNI_BLK);
+                _tile_loadd(TMM1, Tile1, TILE_N * VNNI_BLK);
+            } else {
+                _tile_loadd(TMM0, B_blk0, TILE_N * VNNI_BLK);
                 _tile_loadd(TMM1, B_blk1, TILE_N * VNNI_BLK);
             }
 
@@ -2180,29 +2134,49 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
                 _tile_loadd(TMM2, Tile23, TILE_K);
             }
 
+            // === Phase 2: Zero tiles (batch) ===
+            _tile_zero(TMM4);
+            _tile_zero(TMM6);
+            if (m1 != 0) {
+                _tile_zero(TMM5);
+                _tile_zero(TMM7);
+            }
+
+            // === Phase 3: Compute tiles (batch AMX operations) ===
             _tile_dpbssd(TMM4, TMM2, TMM0);
             _tile_dpbssd(TMM6, TMM2, TMM1);
-
-            _tile_stored(TMM4, Tile4(C_cur), TILE_N * sizeof(int32_t));
-            _tile_stored(TMM6, Tile6(C_cur), TILE_N * sizeof(int32_t));
-
-            GGML_DISPATCH_BOOL(i > 0, is_acc, [&] {
-                acc_C<TA, TB, is_acc>::apply(C,          ldc, Tile4(C_cur), &A[i], KB, B + PACKED_INDEX(0, i, KB, TILE_SIZE), m0);
-                acc_C<TA, TB, is_acc>::apply(C + TILE_N, ldc, Tile6(C_cur), &A[i], KB, B + PACKED_INDEX(1, i, KB, TILE_SIZE), m0);
-            });
 
             if (m1 != 0) {
                 unpack_A(Tile23, &A[TILE_M * KB + i], KB, m1);
                 _tile_loadd(TMM3, Tile23, TILE_K);
-
                 _tile_dpbssd(TMM5, TMM3, TMM0);
                 _tile_dpbssd(TMM7, TMM3, TMM1);
-                _tile_stored(TMM5, Tile5(C_cur), TILE_N * sizeof(int32_t));
-                _tile_stored(TMM7, Tile7(C_cur), TILE_N * sizeof(int32_t));
-                GGML_DISPATCH_BOOL(i > 0, is_acc, [&] {
-                    acc_C<TA, TB, is_acc>::apply(C + TILE_M * ldc,          ldc, Tile5(C_cur), &A[TILE_M * KB + i], KB, B + PACKED_INDEX(0, i, KB, TILE_SIZE), m1);
-                    acc_C<TA, TB, is_acc>::apply(C + TILE_M * ldc + TILE_N, ldc, Tile7(C_cur), &A[TILE_M * KB + i], KB, B + PACKED_INDEX(1, i, KB, TILE_SIZE), m1);
-                });
+            }
+
+            // === Phase 4: Store tiles (batch) ===
+            _tile_stored(TMM4, Tile4(TileC0), TILE_N * sizeof(int32_t));
+            _tile_stored(TMM6, Tile6(TileC0), TILE_N * sizeof(int32_t));
+            if (m1 != 0) {
+                _tile_stored(TMM5, Tile5(TileC0), TILE_N * sizeof(int32_t));
+                _tile_stored(TMM7, Tile7(TileC0), TILE_N * sizeof(int32_t));
+            }
+
+            // === Phase 5: Dequantize and accumulate (batch AVX512 operations) ===
+            const bool is_acc = (i > 0);
+            if (is_acc) {
+                acc_C<TA, TB, true>::apply(C,          ldc, Tile4(TileC0), &A[i], KB, B_blk0, m0);
+                acc_C<TA, TB, true>::apply(C + TILE_N, ldc, Tile6(TileC0), &A[i], KB, B_blk1, m0);
+                if (m1 != 0) {
+                    acc_C<TA, TB, true>::apply(C + TILE_M * ldc,          ldc, Tile5(TileC0), &A[TILE_M * KB + i], KB, B_blk0, m1);
+                    acc_C<TA, TB, true>::apply(C + TILE_M * ldc + TILE_N, ldc, Tile7(TileC0), &A[TILE_M * KB + i], KB, B_blk1, m1);
+                }
+            } else {
+                acc_C<TA, TB, false>::apply(C,          ldc, Tile4(TileC0), &A[i], KB, B_blk0, m0);
+                acc_C<TA, TB, false>::apply(C + TILE_N, ldc, Tile6(TileC0), &A[i], KB, B_blk1, m0);
+                if (m1 != 0) {
+                    acc_C<TA, TB, false>::apply(C + TILE_M * ldc,          ldc, Tile5(TileC0), &A[TILE_M * KB + i], KB, B_blk0, m1);
+                    acc_C<TA, TB, false>::apply(C + TILE_M * ldc + TILE_N, ldc, Tile7(TileC0), &A[TILE_M * KB + i], KB, B_blk1, m1);
+                }
             }
         }
     }
