@@ -2161,29 +2161,98 @@ struct ggml_numa_mirror_buffer {
     bool     read_only;                          // true for model buffers (written once), false for runtime buffers (KV cache, output)
 };
 
-// NUMA helper functions - weak defaults that can be overridden by ggml-cpu.c
-// When ggml-cpu is linked, its strong symbols will override these defaults
-#if defined(__GNUC__) || defined(__clang__)
-    #define GGML_WEAK_SYMBOL __attribute__((weak))
-#else
-    #define GGML_WEAK_SYMBOL
-#endif
+// NUMA helper functions - dynamically resolved from loaded CPU backend
+// This is necessary because the CPU backend is loaded as a shared library,
+// and weak symbols don't work properly with dynamic loading
+static uint32_t ggml_get_active_numa_nodes_dynamic(bool * active_nodes, uint32_t max_nodes) {
+    // Try to get the function from the CPU backend
+    static auto * func = []() -> uint32_t (*)(bool *, uint32_t) {
+        // Find CPU backend registry
+        size_t reg_count = ggml_backend_reg_count();
+        fprintf(stderr, "[DEBUG] %s: searching %zu backend registries for NUMA functions\n", __func__, reg_count);
+        for (size_t i = 0; i < reg_count; i++) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            const char * reg_name = ggml_backend_reg_name(reg);
+            fprintf(stderr, "[DEBUG] %s: checking backend '%s'\n", __func__, reg_name ? reg_name : "(null)");
+            if (reg_name && (strcmp(reg_name, "CPU") == 0 || strcmp(reg_name, "CPU_REPACK") == 0 ||
+                             strcmp(reg_name, "AMX") == 0 || strstr(reg_name, "CPU") != nullptr)) {
+                void * proc = ggml_backend_reg_get_proc_address(reg, "ggml_get_active_numa_nodes");
+                if (proc) {
+                    fprintf(stderr, "[DEBUG] %s: found ggml_get_active_numa_nodes in backend '%s'\n", __func__, reg_name);
+                    return (uint32_t (*)(bool *, uint32_t))proc;
+                } else {
+                    fprintf(stderr, "[DEBUG] %s: ggml_get_active_numa_nodes not found in backend '%s'\n", __func__, reg_name);
+                }
+            }
+        }
+        fprintf(stderr, "[DEBUG] %s: ggml_get_active_numa_nodes not found in any backend, NUMA mirror mode will not work\n", __func__);
+        return nullptr;
+    }();
 
-extern "C" {
-    // Weak default implementations (used when ggml-cpu is not linked)
-    GGML_WEAK_SYMBOL uint32_t ggml_get_active_numa_nodes(bool * active_nodes, uint32_t max_nodes) {
-        (void)active_nodes; (void)max_nodes;
-        return 0; // No NUMA nodes detected
+    if (func) {
+        return func(active_nodes, max_nodes);
     }
-
-    GGML_WEAK_SYMBOL uint32_t ggml_get_current_numa_node(void) {
-        return 0; // Default to node 0
-    }
-
-    GGML_WEAK_SYMBOL enum ggml_numa_strategy ggml_get_numa_strategy(void) {
-        return GGML_NUMA_STRATEGY_DISABLED; // NUMA disabled by default
-    }
+    // Fallback if not found
+    (void)active_nodes; (void)max_nodes;
+    return 0;
 }
+
+static uint32_t ggml_get_current_numa_node_dynamic(void) {
+    static auto * func = []() -> uint32_t (*)() {
+        size_t reg_count = ggml_backend_reg_count();
+        for (size_t i = 0; i < reg_count; i++) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            const char * reg_name = ggml_backend_reg_name(reg);
+            if (reg_name && (strcmp(reg_name, "CPU") == 0 || strcmp(reg_name, "CPU_REPACK") == 0 ||
+                             strcmp(reg_name, "AMX") == 0 || strstr(reg_name, "CPU") != nullptr)) {
+                void * proc = ggml_backend_reg_get_proc_address(reg, "ggml_get_current_numa_node");
+                if (proc) {
+                    return (uint32_t (*)())proc;
+                }
+            }
+        }
+        return nullptr;
+    }();
+
+    if (func) {
+        return func();
+    }
+    return 0;
+}
+
+static enum ggml_numa_strategy ggml_get_numa_strategy_dynamic(void) {
+    // Use static function pointer that we only look up once we find it
+    static enum ggml_numa_strategy (*func)(void) = nullptr;
+    static bool lookup_attempted = false;
+
+    // Try to find the function if we haven't found it yet
+    if (!func && !lookup_attempted) {
+        lookup_attempted = true;  // Only try once to avoid spam
+        size_t reg_count = ggml_backend_reg_count();
+        for (size_t i = 0; i < reg_count; i++) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            const char * reg_name = ggml_backend_reg_name(reg);
+            if (reg_name && (strcmp(reg_name, "CPU") == 0 || strcmp(reg_name, "CPU_REPACK") == 0 ||
+                             strcmp(reg_name, "AMX") == 0 || strstr(reg_name, "CPU") != nullptr)) {
+                void * proc = ggml_backend_reg_get_proc_address(reg, "ggml_get_numa_strategy");
+                if (proc) {
+                    func = (enum ggml_numa_strategy (*)(void))proc;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (func) {
+        return func();
+    }
+    return GGML_NUMA_STRATEGY_DISABLED;
+}
+
+// Use dynamic wrappers instead of weak symbols
+#define ggml_get_active_numa_nodes ggml_get_active_numa_nodes_dynamic
+#define ggml_get_current_numa_node ggml_get_current_numa_node_dynamic
+#define ggml_get_numa_strategy ggml_get_numa_strategy_dynamic
 
 // Forward declaration for regular CPU buffer functions
 static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
@@ -2390,8 +2459,11 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_mirror_buffer_type(void) {
 // This should be called by delegating buffer types (REPACK, AMX) instead of directly
 // allocating from CPU buffer type
 static ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr_with_mirror_check(void * ptr, size_t size) {
+    fprintf(stderr, "[DEBUG] %s: checking NUMA strategy, size=%zu\n", __func__, size);
     // Check if NUMA mirror mode is active
-    if (ggml_get_numa_strategy() == GGML_NUMA_STRATEGY_MIRROR) {
+    enum ggml_numa_strategy strategy = ggml_get_numa_strategy();
+    fprintf(stderr, "[DEBUG] %s: ggml_get_numa_strategy() returned %d\n", __func__, strategy);
+    if (strategy == GGML_NUMA_STRATEGY_MIRROR) {
         // Allocate a mirror buffer
         ggml_backend_buffer_t mirror_buffer = ggml_backend_cpu_mirror_buffer_type_alloc_buffer(
             ggml_backend_cpu_mirror_buffer_type(), size);
@@ -2424,9 +2496,16 @@ static const char * ggml_backend_cpu_buffer_type_get_name(ggml_backend_buffer_ty
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    // Note: NUMA mirror mode is NOT checked here
-    // Only specific buffer types (REPACK, AMX) should allocate mirror buffers
-    // Runtime buffers (CPU output, KV cache) should use regular allocation
+#if defined(__gnu_linux__)
+    // Check if NUMA mirror mode is active
+    // When mirror mode is enabled, delegate to mirror buffer allocation
+    // This is called by AMX and REPACK buffer types when they detect mirror mode
+    if (ggml_get_numa_strategy() == GGML_NUMA_STRATEGY_MIRROR) {
+        return ggml_backend_cpu_mirror_buffer_type_alloc_buffer(ggml_backend_cpu_mirror_buffer_type(), size);
+    }
+#endif
+
+    // Regular allocation for non-mirror mode
     void * data = ggml_aligned_malloc(size);
 
     if (data == NULL) {

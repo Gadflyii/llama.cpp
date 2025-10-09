@@ -642,6 +642,15 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_is_numa") == 0) {
         return (void *)ggml_is_numa;
     }
+    if (strcmp(name, "ggml_get_active_numa_nodes") == 0) {
+        return (void *)ggml_get_active_numa_nodes;
+    }
+    if (strcmp(name, "ggml_get_current_numa_node") == 0) {
+        return (void *)ggml_get_current_numa_node;
+    }
+    if (strcmp(name, "ggml_get_numa_strategy") == 0) {
+        return (void *)ggml_get_numa_strategy;
+    }
 
     // threadpool - TODO:  move to ggml-base
     if (strcmp(name, "ggml_threadpool_new") == 0) {
