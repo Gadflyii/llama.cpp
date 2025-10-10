@@ -2062,6 +2062,16 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
             const char * B_blk0 = B + PACKED_INDEX(0, i, KB, TILE_SIZE);
             const char * B_blk1 = B + PACKED_INDEX(1, i, KB, TILE_SIZE);
 
+            // Prefetch next iteration's data to hide memory latency (SparAMX technique)
+            if (i + 1 < KB) {
+                const char * B_blk0_next = B + PACKED_INDEX(0, i + 1, KB, TILE_SIZE);
+                const char * B_blk1_next = B + PACKED_INDEX(1, i + 1, KB, TILE_SIZE);
+                _mm_prefetch(B_blk0_next, _MM_HINT_T0);
+                _mm_prefetch(B_blk1_next, _MM_HINT_T0);
+                _mm_prefetch((const char*)&A[i + 1].qs, _MM_HINT_T0);
+                _mm_prefetch((const char*)&A[TILE_M * KB + i + 1].qs, _MM_HINT_T0);
+            }
+
             // === Phase 1: Load all inputs (batch for better memory pipelining) ===
             if (need_unpack) {
                 unpack_B<TB>(Tile0, B_blk0);
@@ -2115,6 +2125,18 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
         for (int i = 0; i < KB; ++i) {
             const char * B_blk0 = B + PACKED_INDEX(0, i, KB, TILE_SIZE);
             const char * B_blk1 = B + PACKED_INDEX(1, i, KB, TILE_SIZE);
+
+            // Prefetch next iteration's data (SparAMX technique)
+            if (i + 1 < KB) {
+                const char * B_blk0_next = B + PACKED_INDEX(0, i + 1, KB, TILE_SIZE);
+                const char * B_blk1_next = B + PACKED_INDEX(1, i + 1, KB, TILE_SIZE);
+                _mm_prefetch(B_blk0_next, _MM_HINT_T0);
+                _mm_prefetch(B_blk1_next, _MM_HINT_T0);
+                _mm_prefetch((const char*)&A[i + 1].qs, _MM_HINT_T0);
+                if (m1 != 0) {
+                    _mm_prefetch((const char*)&A[TILE_M * KB + i + 1].qs, _MM_HINT_T0);
+                }
+            }
 
             // === Phase 1: Load all inputs (batch) ===
             if (need_unpack) {
@@ -2215,6 +2237,18 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
 
     const int k_group_size = std::is_same<TB, block_q6_K>::value ? 16 : 32;
     for (int i = 0; i < KB; ++i) {
+        // Prefetch next K-block data (SparAMX technique)
+        if (i + 1 < KB) {
+            const char * B_blk0_next = B + PACKED_INDEX(0, i + 1, KB, TILE_SIZE);
+            const char * B_blk1_next = B + PACKED_INDEX(1, i + 1, KB, TILE_SIZE);
+            _mm_prefetch(B_blk0_next, _MM_HINT_T0);
+            _mm_prefetch(B_blk1_next, _MM_HINT_T0);
+            _mm_prefetch((const char*)&A[i + 1], _MM_HINT_T0);
+            if (m1 != 0) {
+                _mm_prefetch((const char*)&A[TILE_M * KB + i + 1], _MM_HINT_T0);
+            }
+        }
+
         // step 1: accumulate the quants across 8 groups, each group with 32
         for (int k = 0; k < QK_K / k_group_size; ++k) {
             GGML_DISPATCH_BOOL(k > 0, is_acc, [&] {
