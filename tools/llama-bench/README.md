@@ -24,7 +24,7 @@ usage: llama-bench [options]
 
 options:
   -h, --help
-  --numa <distribute|isolate|numactl>       numa mode (default: disabled)
+  --numa <distribute|isolate|numactl|mirror> numa mode (default: disabled)
   -r, --repetitions <n>                     number of times to repeat each test (default: 5)
   --prio <0|1|2|3>                          process/thread priority (default: 0)
   --delay <0...N> (seconds)                 delay between each test (default: 0)

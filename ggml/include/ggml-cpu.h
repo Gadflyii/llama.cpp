@@ -34,6 +34,11 @@ extern "C" {
     GGML_BACKEND_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
 
+    // NUMA helper functions for mirror mode (defined in ggml-cpu.c)
+    GGML_BACKEND_API uint32_t ggml_get_active_numa_nodes(bool * active_nodes, uint32_t max_nodes);
+    GGML_BACKEND_API uint32_t ggml_get_current_numa_node(void);
+    GGML_BACKEND_API enum ggml_numa_strategy ggml_get_numa_strategy(void);
+
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);
 

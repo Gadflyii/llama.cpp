@@ -395,6 +395,17 @@ endforeach()
 
 target_link_libraries(ggml-base PRIVATE Threads::Threads)
 
+# Link against libnuma for NUMA mirror support on Linux (used by ggml-backend.cpp)
+if (UNIX AND NOT APPLE)
+    find_library(NUMA_LIBRARY numa)
+    if (NUMA_LIBRARY)
+        message(STATUS "Found libnuma for ggml-base: ${NUMA_LIBRARY}")
+        target_link_libraries(ggml-base PUBLIC ${NUMA_LIBRARY})
+    else()
+        message(WARNING "libnuma not found - NUMA mirror mode will not be available")
+    endif()
+endif()
+
 find_library(MATH_LIBRARY m)
 if (MATH_LIBRARY)
     if (NOT WIN32 OR NOT DEFINED ENV{ONEAPI_ROOT})

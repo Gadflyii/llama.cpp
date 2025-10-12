@@ -682,6 +682,62 @@ bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
 }
 
+#if defined(__gnu_linux__)
+// Determine which NUMA nodes are active based on the cpuset
+// Returns the number of active nodes
+// Made non-static for use in ggml-backend.cpp
+uint32_t ggml_get_active_numa_nodes(bool * active_nodes, uint32_t max_nodes) {
+    uint32_t n_active = 0;
+
+    // Initialize all to false
+    for (uint32_t i = 0; i < max_nodes; i++) {
+        active_nodes[i] = false;
+    }
+
+    // If NUMA not initialized yet, return 0
+    if (g_state.numa.n_nodes == 0) {
+        return 0;
+    }
+
+    cpu_set_t cpuset = g_state.numa.cpuset;
+
+    // Check which nodes have CPUs in the cpuset
+    for (uint32_t node = 0; node < g_state.numa.n_nodes && node < max_nodes; node++) {
+        struct ggml_numa_node * n = &g_state.numa.nodes[node];
+        for (uint32_t i = 0; i < n->n_cpus; i++) {
+            if (CPU_ISSET(n->cpus[i], &cpuset)) {
+                active_nodes[node] = true;
+                n_active++;
+                break;
+            }
+        }
+    }
+
+    return n_active;
+}
+
+// Get the current NUMA node for the calling thread
+// Made non-static for use in ggml-backend.cpp
+uint32_t ggml_get_current_numa_node(void) {
+    uint32_t node = 0;
+#if __GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ > 33) || defined(__COSMOPOLITAN__)
+    getcpu(NULL, &node);
+#else
+#   if !defined(SYS_getcpu) && defined(SYS_get_cpu)
+#       define SYS_getcpu SYS_get_cpu
+#   endif
+    syscall(SYS_getcpu, NULL, &node);
+#endif
+    return node;
+}
+
+// Get the current NUMA strategy
+// Made non-static for use in ggml-backend.cpp
+enum ggml_numa_strategy ggml_get_numa_strategy(void) {
+    return g_state.numa.numa_strategy;
+}
+#endif // __gnu_linux__
+
 #if defined(__ARM_ARCH)
 
 #if defined(__linux__) && defined(__aarch64__)
@@ -2071,6 +2127,14 @@ static void set_numa_thread_affinity(int thread_n) {
             break;
         case GGML_NUMA_STRATEGY_NUMACTL:
             // use the cpuset that numactl gave us
+            rv = pthread_setaffinity_np(pthread_self(), setsize, &g_state.numa.cpuset);
+            if (rv) {
+                fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n",strerror(rv));
+            }
+            return;
+        case GGML_NUMA_STRATEGY_MIRROR:
+            // For mirror mode, use the cpuset that numactl gave us
+            // Threads will access their local NUMA node's buffer replica
             rv = pthread_setaffinity_np(pthread_self(), setsize, &g_state.numa.cpuset);
             if (rv) {
                 fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n",strerror(rv));
