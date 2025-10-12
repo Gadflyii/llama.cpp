@@ -13,6 +13,7 @@
 #include "ggml-quants.h"
 #include <algorithm>
 #include <type_traits>
+#include <cstdlib>  // for std::getenv, std::atoi
 
 #if defined(__gnu_linux__)
 #include <sys/syscall.h>
@@ -34,6 +35,25 @@
 #endif
 
 #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+
+// Helper function to get AMX VNNI fallback threshold from environment variable
+// Returns the M value below which VNNI fallback should be used instead of AMX
+// Default: 0 (always use AMX)
+// Set GGML_AMX_VNNI_THRESHOLD=1 to use VNNI for M=1, AMX for M>1
+// Set GGML_AMX_VNNI_THRESHOLD=2 to use VNNI for M<=2, AMX for M>2, etc.
+static int get_amx_vnni_threshold() {
+    static int threshold = -1;  // Cache the value
+    if (threshold == -1) {
+        const char* env = std::getenv("GGML_AMX_VNNI_THRESHOLD");
+        if (env) {
+            threshold = std::atoi(env);
+            if (threshold < 0) threshold = 0;  // Clamp to non-negative
+        } else {
+            threshold = 0;  // Default: always use AMX
+        }
+    }
+    return threshold;
+}
 
 namespace {
 
@@ -2453,10 +2473,10 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
 
     ggml_barrier(params->threadpool);
 
-    // OPTIMIZATION: Use AMX tiles for M=1 instead of VNNI fallback
+    // OPTIMIZATION: Configurable AMX vs VNNI threshold
     //
     // Previous behavior: M==1 used VNNI (AVX512-VNNI) to avoid tile config overhead
-    // New behavior: M==1 uses AMX tiles for better hardware utilization
+    // Current default: Always use AMX tiles for better hardware utilization
     //
     // Benchmark results (Dense 70B, 50 token generation):
     //   VNNI path:  16.128s, 0.22% AMX utilization (4.24B cycles busy)
@@ -2468,10 +2488,15 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
     // - AMX path has 2x higher IPC (0.24 → 0.57) showing better compute efficiency
     // - 2.2% latency increase is acceptable for production workloads
     // - Much higher AMX utilization = better hardware usage
-    // - Removes code duplication (VNNI kernel vs AMX kernel)
     //
-    // Note: VNNI fallback code preserved but disabled for reference
-    if (false && M == 1) {
+    // Environment variable control:
+    // - GGML_AMX_VNNI_THRESHOLD=0 (default): Always use AMX
+    // - GGML_AMX_VNNI_THRESHOLD=1: Use VNNI for M=1, AMX for M>1
+    // - GGML_AMX_VNNI_THRESHOLD=N: Use VNNI for M<=N, AMX for M>N
+    //
+    // Note: VNNI fallback only supports M==1 currently
+    const int vnni_threshold = get_amx_vnni_threshold();
+    if (vnni_threshold > 0 && M == 1) {
         // MB = 1 and handle 8 tiles in each block
         constexpr int kTilesN = 4;
         constexpr int BLOCK_N = TILE_N * kTilesN;
