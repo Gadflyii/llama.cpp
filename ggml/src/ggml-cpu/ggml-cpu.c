@@ -1461,6 +1461,32 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
+// AMX precision thresholds for adaptive kernel selection
+#define AMX_INT8_THRESHOLD  32
+#define AMX_BF16_THRESHOLD  16
+
+// AMX precision modes for MoE expert processing
+enum amx_precision_mode {
+    AMX_PRECISION_VNNI = 0,  // < 16 tokens (VNNI fallback)
+    AMX_PRECISION_BF16 = 1,  // >= 16 tokens (BF16 AMX)
+    AMX_PRECISION_INT8 = 2,  // >= 32 tokens (INT8 AMX)
+};
+
+// Per-expert precision group (secondary grouping for AMX)
+struct amx_moe_group {
+    int32_t expert_id;
+    int32_t token_count;
+    int32_t token_offset;
+    enum amx_precision_mode precision;
+};
+
+// Per-expert statistics for AMX token grouping
+struct amx_expert_stats {
+    int64_t total_tokens;
+    int32_t group_count;
+    struct amx_moe_group group;
+};
+
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -1581,6 +1607,9 @@ static void ggml_compute_forward_mul_mat_id(
     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
 
+    struct amx_expert_stats * amx_expert_stats = // [n_as]
+        incr_ptr_aligned(&wdata_cur, n_as*sizeof(struct amx_expert_stats), sizeof(int64_t));
+
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
     if (src1->type != vec_dot_type) {
@@ -1621,8 +1650,9 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
-        // initialize matrix_row_counts
+        // initialize matrix_row_counts and amx_expert_stats
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+        memset(amx_expert_stats, 0, n_as*sizeof(struct amx_expert_stats));
 
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
@@ -1635,6 +1665,61 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+
+        // Phase 1: Secondary token grouping by precision threshold (AMX-aware)
+        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+            const int64_t token_count = matrix_row_counts[cur_a];
+
+            if (token_count == 0) {
+                continue;
+            }
+
+            // Determine AMX precision mode based on token count
+            enum amx_precision_mode precision;
+            if (token_count >= AMX_INT8_THRESHOLD) {
+                precision = AMX_PRECISION_INT8;
+            } else if (token_count >= AMX_BF16_THRESHOLD) {
+                precision = AMX_PRECISION_BF16;
+            } else {
+                precision = AMX_PRECISION_VNNI;
+            }
+
+            // Store group statistics
+            amx_expert_stats[cur_a].total_tokens = token_count;
+            amx_expert_stats[cur_a].group_count = 1;
+            amx_expert_stats[cur_a].group.expert_id = cur_a;
+            amx_expert_stats[cur_a].group.token_count = token_count;
+            amx_expert_stats[cur_a].group.token_offset = 0;
+            amx_expert_stats[cur_a].group.precision = precision;
+        }
+
+#ifdef GGML_DEBUG_AMX_MOE
+        // Debug logging for AMX grouping (disabled by default)
+        int64_t total_int8 = 0, total_bf16 = 0, total_vnni = 0;
+        int count_int8 = 0, count_bf16 = 0, count_vnni = 0;
+
+        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+            if (amx_expert_stats[cur_a].total_tokens > 0) {
+                enum amx_precision_mode prec = amx_expert_stats[cur_a].group.precision;
+                int64_t tc = amx_expert_stats[cur_a].total_tokens;
+
+                if (prec == AMX_PRECISION_INT8) {
+                    total_int8 += tc;
+                    count_int8++;
+                } else if (prec == AMX_PRECISION_BF16) {
+                    total_bf16 += tc;
+                    count_bf16++;
+                } else {
+                    total_vnni += tc;
+                    count_vnni++;
+                }
+            }
+        }
+
+        fprintf(stderr, "[AMX-MoE] Precision distribution: INT8=%d experts (%ld tokens), "
+                        "BF16=%d experts (%ld tokens), VNNI=%d experts (%ld tokens)\n",
+                count_int8, total_int8, count_bf16, total_bf16, count_vnni, total_vnni);
+#endif
     }
 
     // reset current_chunk
@@ -1651,6 +1736,10 @@ static void ggml_compute_forward_mul_mat_id(
         if (cne1 == 0) {
             continue;
         }
+
+        // Phase 1: Token grouping complete - precision mode available in amx_expert_stats[cur_a].group.precision
+        // Future phases (2-4) will use this to select AMX INT8/BF16/VNNI kernels
+        // For now, continue with existing matmul path
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
@@ -2815,6 +2904,8 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                        // amx_expert_stats (Phase 1: token grouping)
+                        cur += n_as*sizeof(struct amx_expert_stats) + sizeof(int64_t);
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
