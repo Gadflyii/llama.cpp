@@ -1738,8 +1738,23 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         // Phase 1: Token grouping complete - precision mode available in amx_expert_stats[cur_a].group.precision
-        // Future phases (2-4) will use this to select AMX INT8/BF16/VNNI kernels
-        // For now, continue with existing matmul path
+        // Phase 3: AMX integration point (TODO for future implementation)
+        //
+        // The infrastructure is in place for AMX integration:
+        // 1. Token grouping creates batches of tokens per expert (Phase 1)
+        // 2. Precision classification determines INT8/BF16/VNNI mode (Phase 1)
+        // 3. AMX infrastructure exists in ggml/src/ggml-cpu/amx/ (existing)
+        //
+        // To enable AMX for MoE:
+        // 1. Check if cne1 >= AMX_BF16_THRESHOLD (16) or AMX_INT8_THRESHOLD (32)
+        // 2. Check if src0 is in AMX buffer (qtype_has_amx_kernels(type))
+        // 3. Call ggml_backend_amx_mul_mat_moe_expert() for batched processing
+        // 4. This bypasses the chunked path and uses AMX tiles directly
+        //
+        // Expected speedup: 3-5x for prompt processing (Phase 3)
+        //                   5-9x with Q8_0_R8 INT8 AMX (Phase 4)
+        //
+        // For now, continue with existing chunked path (VNNI-optimized)
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
