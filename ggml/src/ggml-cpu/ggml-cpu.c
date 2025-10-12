@@ -1737,26 +1737,50 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        // Phase 1: Token grouping complete - precision mode available in amx_expert_stats[cur_a].group.precision
-        // Phase 3: AMX integration point (TODO for future implementation)
-        //
-        // The infrastructure is in place for AMX integration:
-        // 1. Token grouping creates batches of tokens per expert (Phase 1)
-        // 2. Precision classification determines INT8/BF16/VNNI mode (Phase 1)
-        // 3. AMX infrastructure exists in ggml/src/ggml-cpu/amx/ (existing)
-        //
-        // To enable AMX for MoE:
-        // 1. Check if cne1 >= AMX_BF16_THRESHOLD (16) or AMX_INT8_THRESHOLD (32)
-        // 2. Check if src0 is in AMX buffer (qtype_has_amx_kernels(type))
-        // 3. Call ggml_backend_amx_mul_mat_moe_expert() for batched processing
-        // 4. This bypasses the chunked path and uses AMX tiles directly
-        //
-        // Expected speedup: 3-5x for prompt processing (Phase 3)
-        //                   5-9x with Q8_0_R8 INT8 AMX (Phase 4)
-        //
-        // For now, continue with existing chunked path (VNNI-optimized)
-
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+
+#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+        // Phase 3: AMX integration for MoE expert processing
+        // Check if this expert has enough tokens for AMX acceleration
+        const enum amx_precision_mode precision = amx_expert_stats[cur_a].group.precision;
+        const int64_t amx_threshold = (precision == AMX_PRECISION_INT8) ? AMX_INT8_THRESHOLD : AMX_BF16_THRESHOLD;
+
+        // AMX dispatch conditions:
+        // 1. Batch size meets threshold (M >= 16 for BF16, M >= 32 for INT8)
+        // 2. Only thread 0 processes (to avoid race conditions)
+        // 3. Expert weights are in AMX-compatible format
+        if (cne1 >= amx_threshold && ith == 0) {
+            // Import AMX MoE function (declared in amx/mmq.h with extern "C")
+            extern void ggml_backend_amx_mul_mat_moe_expert(
+                const struct ggml_compute_params * params,
+                struct ggml_tensor * dst,
+                const struct ggml_tensor * src0,
+                const struct ggml_tensor * src1,
+                const struct ggml_tensor * ids,
+                const int64_t expert_id,
+                const struct mmid_row_mapping * token_mappings,
+                const int64_t num_tokens,
+                const char * expert_weights,
+                const void * wdata,
+                const size_t row_size);
+
+            const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+            const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+            ggml_backend_amx_mul_mat_moe_expert(
+                params, dst, src0, src1, ids,
+                cur_a,  // expert_id
+                matrix_rows + cur_a * ids->ne[0] * ids->ne[1],  // token_mappings for this expert
+                cne1,   // num_tokens
+                src0_cur,  // expert_weights
+                wdata,
+                row_size
+            );
+
+            // Skip the chunked path below
+            continue;
+        }
+#endif // __AMX_INT8__ && __AVX512VNNI__
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 

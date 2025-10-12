@@ -2615,4 +2615,128 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
     });
 }
 
+// MoE-specific matmul using AMX tiles for batched expert processing
+//
+// Called from ggml_compute_forward_mul_mat_id when processing a single expert
+// with M >= AMX_THRESHOLD tokens (M >= 16 for BF16, M >= 32 for INT8)
+//
+// src0: expert weights [K=n_embd, N=n_ff], quantized
+// src1: input activations [ne11, K=n_embd], float32 (original tensor)
+// dst:  output [n_as, ne12, N=n_ff], float32
+// wdata: quantized src1 data (already converted)
+// token_mappings: maps expert's local token index → global token position
+// num_tokens: M (number of tokens assigned to this expert)
+//
+// Performs: dst[expert_id] = src1[tokens] @ src0.T
+//          where tokens are the M tokens assigned to this expert
+//
+void ggml_backend_amx_mul_mat_moe_expert(
+    const ggml_compute_params * params,
+    struct ggml_tensor * dst,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    const struct ggml_tensor * ids,
+    const int64_t expert_id,
+    const struct mmid_row_mapping * token_mappings,
+    const int64_t num_tokens,
+    const char * expert_weights,
+    const void * wdata,
+    const size_t row_size) {
+
+    const enum ggml_type TYPE = src0->type;
+
+    const int M = num_tokens;  // batch size for this expert
+    const int N = dst->ne[0];  // output features (n_ff)
+    const int K = src0->ne[0]; // input features (n_embd)
+
+    // Allocate temporary buffers (thread-safe, separate per expert)
+    // Note: This is a simplified implementation; production code should manage buffers more carefully
+    std::vector<char> quantized_input_buffer;
+    std::vector<float> output_buffer;
+
+    GGML_DISPATCH_QTYPES(TYPE, [&] {
+        const size_t row_size_A = K / blck_size * sizeof(vec_dot_type);
+
+        // Allocate buffers
+        quantized_input_buffer.resize(M * row_size_A);
+        output_buffer.resize(M * N);
+
+        // Quantize M rows of input for this expert
+        if (params->ith == 0) {
+            for (int m = 0; m < M; ++m) {
+                const struct mmid_row_mapping map = token_mappings[m];
+                const int token_id = map.i1;     // token ID
+                const int batch_idx = map.i2;    // batch index
+
+                // Source: original float data from src1
+                const int64_t i11 = token_id % src1->ne[0];
+                const int64_t i12 = batch_idx;
+                const float * src_row = (const float *)((char *)src1->data + i12*src1->nb[1] + i11*src1->nb[0]);
+
+                // Destination: contiguous buffer for this expert
+                char * dst_row = quantized_input_buffer.data() + m * row_size_A;
+
+                // Quantize row to vec_dot_type
+                from_float<vec_dot_type>(src_row, dst_row, K);
+            }
+        }
+
+        ggml_barrier(params->threadpool);
+
+        // AMX matmul: [M, K] @ [K, N] → [M, N]
+        constexpr int BLOCK_M = TILE_M * 2;
+        constexpr int BLOCK_N = TILE_N * 2;
+        const int MB = div_up(M, BLOCK_M);
+        const int NB = div_up(N, BLOCK_N);
+
+        parallel_for_ggml(params, MB * NB, [&](int begin, int end) {
+            // Initialize tile config for each thread
+            ggml_tile_config_init();
+
+            const int KB = K / blck_size;
+            const int TILE_SIZE = get_tile_size<type>();
+            const int row_size_A = KB * sizeof(vec_dot_type);
+
+            for (int i = begin; i < end; ++i) {
+                int mb = i / NB;
+                int nb = i % NB;
+
+                int mb_start = mb * BLOCK_M;
+                int mb_size = std::min(BLOCK_M, M - mb_start);
+                int nb_start = nb * BLOCK_N;
+                int nb_size = BLOCK_N;
+
+                // Output to temporary contiguous buffer
+                float * out = output_buffer.data() + mb_start * N + nb_start;
+
+                tinygemm_kernel_amx<vec_dot_type, type, float, blck_size>(
+                    mb_size, nb_size, KB,
+                    (const char *)quantized_input_buffer.data() + mb_start * row_size_A,
+                    (const char *)expert_weights + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
+                    out, N);  // ldc = N for contiguous output
+            }
+        });
+
+        ggml_barrier(params->threadpool);
+
+        // Scatter output back to correct token positions
+        if (params->ith == 0) {
+            for (int m = 0; m < M; ++m) {
+                const struct mmid_row_mapping map = token_mappings[m];
+                const int token_id = map.i1;     // token ID
+                const int batch_idx = map.i2;    // batch index
+
+                // Destination: dst[token_id, batch_idx]
+                const int64_t i1 = token_id % src1->ne[0];
+                const int64_t i2 = batch_idx;
+                float * dst_row = (float *)((char *)dst->data + i1*dst->nb[1] + i2*dst->nb[2]);
+
+                // Copy from output buffer
+                const float * src_row = output_buffer.data() + m * N;
+                memcpy(dst_row, src_row, N * sizeof(float));
+            }
+        }
+    });
+}
+
 #endif // if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
