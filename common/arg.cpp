@@ -2811,6 +2811,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NUMA"));
     add_opt(common_arg(
+        {"--amx-arch"}, "ARCH",
+        "select AMX MoE architecture variant\n"
+        "- base: Oct 10 baseline with prefetching + M=1 AMX tiles (default)\n"
+        "- moe: current version with buffer pool optimization\n"
+        "- fused_moe: optimized architecture with activated experts + parallel dispatch\n",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "base" || value == "") { params.amx_arch = GGML_AMX_MOE_ARCH_BASE; }
+            else if (value == "moe") { params.amx_arch = GGML_AMX_MOE_ARCH_MOE; }
+            else if (value == "fused_moe") { params.amx_arch = GGML_AMX_MOE_ARCH_FUSED_MOE; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_AMX_ARCH"));
+    add_opt(common_arg(
         {"-dev", "--device"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading (none = don't offload)\n"
         "use --list-devices to see a list of available devices",

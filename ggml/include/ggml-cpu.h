@@ -39,6 +39,17 @@ extern "C" {
     GGML_BACKEND_API uint32_t ggml_get_current_numa_node(void);
     GGML_BACKEND_API enum ggml_numa_strategy ggml_get_numa_strategy(void);
 
+    // AMX MoE architecture variants
+    enum ggml_amx_moe_arch {
+        GGML_AMX_MOE_ARCH_BASE       = 0, // Oct 10 baseline: prefetching + M=1 AMX tiles
+        GGML_AMX_MOE_ARCH_MOE        = 1, // Current: buffer pool optimization (default)
+        GGML_AMX_MOE_ARCH_FUSED_MOE  = 2, // Optimized: activated experts + parallel dispatch + interleaving
+        GGML_AMX_MOE_ARCH_COUNT
+    };
+
+    GGML_BACKEND_API void ggml_amx_moe_init(enum ggml_amx_moe_arch arch); // select AMX MoE architecture variant
+    GGML_BACKEND_API enum ggml_amx_moe_arch ggml_get_amx_moe_arch(void);  // get current AMX MoE architecture
+
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);
 

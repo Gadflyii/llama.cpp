@@ -124,6 +124,7 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+    ggml_amx_moe_init(params.amx_arch);
 
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;

@@ -309,6 +309,7 @@ struct common_params {
     void * cb_eval_user_data                 = nullptr;
 
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
+    ggml_amx_moe_arch amx_arch = GGML_AMX_MOE_ARCH_BASE;  // default to base (Oct 10 baseline)
 
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
     enum llama_pooling_type      pooling_type      = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling type for embeddings

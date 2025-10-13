@@ -525,6 +525,7 @@ struct ggml_numa_nodes {
 
 struct ggml_state {
     struct ggml_numa_nodes numa;
+    enum ggml_amx_moe_arch amx_moe_arch;
 };
 
 static struct ggml_state g_state = {0};
@@ -737,6 +738,28 @@ enum ggml_numa_strategy ggml_get_numa_strategy(void) {
     return g_state.numa.numa_strategy;
 }
 #endif // __gnu_linux__
+
+//
+// AMX MoE architecture selection
+//
+
+void ggml_amx_moe_init(enum ggml_amx_moe_arch arch) {
+    g_state.amx_moe_arch = arch;
+
+    const char * arch_name = "unknown";
+    switch (arch) {
+        case GGML_AMX_MOE_ARCH_BASE:      arch_name = "base (Oct 10 prefetching)"; break;
+        case GGML_AMX_MOE_ARCH_MOE:       arch_name = "moe (buffer pool optimization)"; break;
+        case GGML_AMX_MOE_ARCH_FUSED_MOE: arch_name = "fused_moe (K_Transformers optimizations)"; break;
+        default: break;
+    }
+
+    GGML_PRINT_DEBUG("AMX MoE architecture: %s\n", arch_name);
+}
+
+enum ggml_amx_moe_arch ggml_get_amx_moe_arch(void) {
+    return g_state.amx_moe_arch;
+}
 
 #if defined(__ARM_ARCH)
 
