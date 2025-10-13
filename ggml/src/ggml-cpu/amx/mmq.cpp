@@ -2720,38 +2720,64 @@ void ggml_backend_amx_mul_mat_moe_expert(
         }
 
         // AMX matmul: [M, K] @ [K, N] → [M, N]
+        // Optimization: Adaptive kernel selection for small M (decode optimization)
         constexpr int BLOCK_M = TILE_M * 2;
         constexpr int BLOCK_N = TILE_N * 2;
-        const int MB = div_up(M, BLOCK_M);
-        const int NB = div_up(N, BLOCK_N);
+        const int KB = K / blck_size;
+        const int TILE_SIZE = get_tile_size<type>();
 
-        parallel_for_ggml(params, MB * NB, [&](int begin, int end) {
-            // Initialize tile config for each thread
+        // Use row-wise processing for very small M (M <= 2) to reduce overhead
+        // This is common in decode (token-by-token generation)
+        if (M <= 2) {
+            // Row-wise kernel: lower overhead for decode
             ggml_tile_config_init();
+            constexpr int TILE_N_SMALL = TILE_N;
+            const int NB_small = div_up(N, TILE_N_SMALL);
 
-            const int KB = K / blck_size;
-            const int TILE_SIZE = get_tile_size<type>();
-            const int row_size_A = KB * sizeof(vec_dot_type);
+            for (int m = 0; m < M; ++m) {
+                const char * a_row = quantized_input_buffer + m * row_size_A;
+                float * out_row = output_buffer + m * N;
 
-            for (int i = begin; i < end; ++i) {
-                int mb = i / NB;
-                int nb = i % NB;
+                for (int nb = 0; nb < NB_small; ++nb) {
+                    const int nb_start = nb * TILE_N_SMALL;
+                    const int nb_size = std::min(TILE_N_SMALL, N - nb_start);
 
-                int mb_start = mb * BLOCK_M;
-                int mb_size = std::min(BLOCK_M, M - mb_start);
-                int nb_start = nb * BLOCK_N;
-                int nb_size = BLOCK_N;
-
-                // Output to temporary contiguous buffer
-                float * out = output_buffer + mb_start * N + nb_start;
-
-                tinygemm_kernel_amx<vec_dot_type, type, float, blck_size>(
-                    mb_size, nb_size, KB,
-                    (const char *)quantized_input_buffer + mb_start * row_size_A,
-                    (const char *)expert_weights + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
-                    out, N);  // ldc = N for contiguous output
+                    tinygemm_kernel_amx<vec_dot_type, type, float, blck_size>(
+                        1, nb_size, KB,  // M=1 for row kernel
+                        a_row,
+                        (const char *)expert_weights + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
+                        out_row + nb_start, N);
+                }
             }
-        });
+        } else {
+            // Tile-based kernel: better for larger M (prefill)
+            const int MB = div_up(M, BLOCK_M);
+            const int NB = div_up(N, BLOCK_N);
+
+            parallel_for_ggml(params, MB * NB, [&](int begin, int end) {
+                // Initialize tile config for each thread
+                ggml_tile_config_init();
+
+                for (int i = begin; i < end; ++i) {
+                    int mb = i / NB;
+                    int nb = i % NB;
+
+                    int mb_start = mb * BLOCK_M;
+                    int mb_size = std::min(BLOCK_M, M - mb_start);
+                    int nb_start = nb * BLOCK_N;
+                    int nb_size = BLOCK_N;
+
+                    // Output to temporary contiguous buffer
+                    float * out = output_buffer + mb_start * N + nb_start;
+
+                    tinygemm_kernel_amx<vec_dot_type, type, float, blck_size>(
+                        mb_size, nb_size, KB,
+                        (const char *)quantized_input_buffer + mb_start * row_size_A,
+                        (const char *)expert_weights + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
+                        out, N);  // ldc = N for contiguous output
+                }
+            });
+        }
 
         // Scatter output back to correct token positions
         for (int m = 0; m < M; ++m) {
