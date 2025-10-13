@@ -1726,48 +1726,87 @@ static void ggml_compute_forward_mul_mat_id_amx_fused_moe(
     // Optimization #1: Build activated expert list (skip empty experts)
     int activated_experts[n_as];
     int activated_count = 0;
+    int64_t total_tokens = 0;
 
     if (ith == 0) {
         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
             if (matrix_row_counts[cur_a] > 0) {
                 activated_experts[activated_count++] = cur_a;
+                total_tokens += matrix_row_counts[cur_a];
             }
         }
     }
 
     ggml_barrier(params->threadpool);
 
-    // Optimization #2: Parallel batch dispatch for all activated experts
-    // Process all experts and their tiles in a single parallel job
-    extern void ggml_backend_amx_mul_mat_moe_batch(
-        const struct ggml_compute_params * params,
-        struct ggml_tensor * dst,
-        const struct ggml_tensor * src0,
-        const struct ggml_tensor * src1,
-        const struct ggml_tensor * ids,
-        const int * activated_experts,
-        const int activated_count,
-        const struct mmid_row_mapping * matrix_rows,
-        const int64_t * matrix_row_counts,
-        const void * wdata,
-        const size_t row_size,
-        const int64_t ne10,
-        const int64_t nb02);
-
     const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
-    ggml_backend_amx_mul_mat_moe_batch(
-        params, dst, src0, src1, ids,
-        activated_experts,
-        activated_count,
-        matrix_rows,
-        matrix_row_counts,
-        wdata,
-        row_size,
-        ne10,
-        nb02
-    );
+    // Optimization #5: Separate decode path
+    // For decode (small total tokens and few active experts), use sequential processing
+    // to avoid thread spawning overhead. This significantly reduces latency.
+    const bool is_decode = (total_tokens <= 8 && activated_count <= 8);
+
+    if (is_decode && ith == 0) {
+        // Decode path: Sequential processing for low latency
+        extern void ggml_backend_amx_mul_mat_moe_expert(
+            const struct ggml_compute_params * params,
+            struct ggml_tensor * dst,
+            const struct ggml_tensor * src0,
+            const struct ggml_tensor * src1,
+            const struct ggml_tensor * ids,
+            const int64_t expert_id,
+            const struct mmid_row_mapping * token_mappings,
+            const int64_t num_tokens,
+            const char * expert_weights,
+            const void * wdata,
+            const size_t row_size);
+
+        for (int idx = 0; idx < activated_count; ++idx) {
+            const int expert_id = activated_experts[idx];
+            const int64_t num_tokens = matrix_row_counts[expert_id];
+            const char * expert_weights = (const char *)src0->data + expert_id * nb02;
+
+            ggml_backend_amx_mul_mat_moe_expert(
+                params, dst, src0, src1, ids,
+                expert_id,
+                matrix_rows + expert_id * ids->ne[0] * ids->ne[1],
+                num_tokens,
+                expert_weights,
+                wdata,
+                row_size
+            );
+        }
+    } else {
+        // Optimization #2: Parallel batch dispatch for all activated experts
+        // Process all experts and their tiles in a single parallel job
+        extern void ggml_backend_amx_mul_mat_moe_batch(
+            const struct ggml_compute_params * params,
+            struct ggml_tensor * dst,
+            const struct ggml_tensor * src0,
+            const struct ggml_tensor * src1,
+            const struct ggml_tensor * ids,
+            const int * activated_experts,
+            const int activated_count,
+            const struct mmid_row_mapping * matrix_rows,
+            const int64_t * matrix_row_counts,
+            const void * wdata,
+            const size_t row_size,
+            const int64_t ne10,
+            const int64_t nb02);
+
+        ggml_backend_amx_mul_mat_moe_batch(
+            params, dst, src0, src1, ids,
+            activated_experts,
+            activated_count,
+            matrix_rows,
+            matrix_row_counts,
+            wdata,
+            row_size,
+            ne10,
+            nb02
+        );
+    }
 }
 
 #endif // __AMX_INT8__ && __AVX512VNNI__
