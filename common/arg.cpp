@@ -2824,6 +2824,63 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_AMX_ARCH"));
     add_opt(common_arg(
+        {"--numa-replicate"}, "MODE",
+        "NUMA weight replication strategy for MoE models\n"
+        "- none: no replication (default for backward compatibility)\n"
+        "- auto: auto-detect sockets and replicate per socket (recommended)\n"
+        "- per-node: replicate on every NUMA node (max performance, high memory)\n"
+        "- groups=0,1:2,3: user-defined groups (e.g., socket-grouped or custom)\n"
+        "WARNING: 'auto' doubles memory, 'per-node' multiplies by N_NUMA nodes",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "none" || value == "") { params.numa_replication.replicate = NUMA_REPLICATE_NONE; }
+            else if (value == "auto") { params.numa_replication.replicate = NUMA_REPLICATE_AUTO; }
+            else if (value == "per-node") { params.numa_replication.replicate = NUMA_REPLICATE_PER_NODE; }
+            else if (value.substr(0, 7) == "groups=") {
+                params.numa_replication.replicate = NUMA_REPLICATE_GROUPS;
+                // Parse groups syntax: "0,1:2,3" -> [[0,1], [2,3]]
+                std::string groups_str = value.substr(7);
+                params.numa_replication.groups.clear();
+
+                size_t start = 0;
+                while (start < groups_str.length()) {
+                    size_t colon_pos = groups_str.find(':', start);
+                    std::string group_str = (colon_pos != std::string::npos) ?
+                        groups_str.substr(start, colon_pos - start) :
+                        groups_str.substr(start);
+
+                    std::vector<int> group;
+                    size_t g_start = 0;
+                    while (g_start < group_str.length()) {
+                        size_t comma_pos = group_str.find(',', g_start);
+                        std::string numa_str = (comma_pos != std::string::npos) ?
+                            group_str.substr(g_start, comma_pos - g_start) :
+                            group_str.substr(g_start);
+
+                        group.push_back(std::stoi(numa_str));
+                        g_start = (comma_pos != std::string::npos) ? comma_pos + 1 : group_str.length();
+                    }
+
+                    if (!group.empty()) {
+                        params.numa_replication.groups.push_back(group);
+                    }
+                    start = (colon_pos != std::string::npos) ? colon_pos + 1 : groups_str.length();
+                }
+            }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_NUMA_REPLICATE"));
+    add_opt(common_arg(
+        {"--numa-alloc"}, "STRATEGY",
+        "NUMA memory allocation strategy within each group\n"
+        "- interleaved: interleave pages across NUMA nodes in group (default)\n"
+        "- striped: stripe experts across NUMA nodes (expert N -> NUMA N % group_size)",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "interleaved" || value == "") { params.numa_replication.alloc = NUMA_ALLOC_INTERLEAVED; }
+            else if (value == "striped") { params.numa_replication.alloc = NUMA_ALLOC_STRIPED; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_NUMA_ALLOC"));
+    add_opt(common_arg(
         {"-dev", "--device"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading (none = don't offload)\n"
         "use --list-devices to see a list of available devices",

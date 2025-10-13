@@ -67,6 +67,34 @@ int32_t cpu_get_num_physical_cores();
 int32_t cpu_get_num_math();
 
 //
+// NUMA replication params
+//
+
+enum numa_replicate_strategy {
+    NUMA_REPLICATE_NONE,        // No replication (default for backward compatibility)
+    NUMA_REPLICATE_AUTO,        // Auto-detect sockets and replicate per socket
+    NUMA_REPLICATE_PER_NODE,    // Replicate on every NUMA node
+    NUMA_REPLICATE_GROUPS,      // User-defined groups
+};
+
+enum numa_alloc_strategy {
+    NUMA_ALLOC_INTERLEAVED,     // Interleave pages across NUMA nodes in group (default)
+    NUMA_ALLOC_STRIPED,         // Stripe experts across NUMA nodes
+};
+
+struct numa_replication_config {
+    numa_replicate_strategy replicate = NUMA_REPLICATE_NONE;
+    numa_alloc_strategy alloc = NUMA_ALLOC_INTERLEAVED;
+    std::vector<std::vector<int>> groups;  // For NUMA_REPLICATE_GROUPS
+};
+
+// Forward declaration for topology
+struct numa_topology;
+
+// Print NUMA replication configuration for diagnostics
+void print_numa_replication_config(const numa_replication_config& config, const numa_topology& topo);
+
+//
 // Common params
 //
 
@@ -310,6 +338,7 @@ struct common_params {
 
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
     ggml_amx_moe_arch amx_arch = GGML_AMX_MOE_ARCH_BASE;  // default to base (Oct 10 baseline)
+    numa_replication_config numa_replication;  // NUMA weight replication configuration
 
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
     enum llama_pooling_type      pooling_type      = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling type for embeddings

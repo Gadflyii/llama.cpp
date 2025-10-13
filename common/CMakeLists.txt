@@ -65,6 +65,8 @@ add_library(${TARGET} STATIC
     log.h
     ngram-cache.cpp
     ngram-cache.h
+    numa_topology.cpp
+    numa_topology.h
     regex-partial.cpp
     regex-partial.h
     sampling.cpp
@@ -169,6 +171,17 @@ if (LLAMA_LLGUIDANCE)
     # Add platform libraries to the main target
     set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} llguidance ${LLGUIDANCE_PLATFORM_LIBS})
 endif ()
+
+# Link libnuma for NUMA topology detection (Linux only)
+if (UNIX AND NOT APPLE)
+    find_library(NUMA_LIBRARY NAMES numa)
+    if (NUMA_LIBRARY)
+        message(STATUS "Found libnuma: ${NUMA_LIBRARY}")
+        set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} ${NUMA_LIBRARY})
+    else()
+        message(WARNING "libnuma not found, NUMA support will be limited")
+    endif()
+endif()
 
 target_include_directories(${TARGET} PUBLIC . ../vendor)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
