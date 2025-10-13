@@ -32,6 +32,21 @@ void ggml_backend_amx_mul_mat_moe_expert(
     const void * wdata,
     const size_t row_size);
 
+void ggml_backend_amx_mul_mat_moe_batch(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    const struct ggml_tensor * ids,
+    const int * activated_experts,
+    const int activated_count,
+    const struct mmid_row_mapping * matrix_rows,
+    const int64_t * matrix_row_counts,
+    const void * wdata,
+    const size_t row_size,
+    const int64_t ne10,
+    const int64_t nb02);
+
 #ifdef __cplusplus
 }
 #endif

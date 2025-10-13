@@ -2783,4 +2783,227 @@ void ggml_backend_amx_mul_mat_moe_expert(
     });
 }
 
+// Optimization #2: Parallel batch dispatch for multiple experts
+// Processes all activated experts in parallel with work-stealing across experts and tiles
+void ggml_backend_amx_mul_mat_moe_batch(
+    const ggml_compute_params * params,
+    struct ggml_tensor * dst,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    const struct ggml_tensor * ids,
+    const int * activated_experts,
+    const int activated_count,
+    const struct mmid_row_mapping * matrix_rows,
+    const int64_t * matrix_row_counts,
+    const void * wdata,
+    const size_t row_size,
+    const int64_t ne10,  // K dimension
+    const int64_t nb02   // stride between experts
+) {
+    const enum ggml_type TYPE = src0->type;
+    const int K = ne10;
+    const int N = dst->ne[0];
+
+    // Per-expert buffer structure
+    struct expert_buffers {
+        std::vector<char> quantized_input;
+        std::vector<float> output;
+        int M;  // num tokens for this expert
+        int expert_id;
+    };
+
+    // Allocate buffers for all activated experts
+    std::vector<expert_buffers> expert_bufs(activated_count);
+
+    GGML_DISPATCH_QTYPES(TYPE, [&] {
+        const size_t row_size_A = K / blck_size * sizeof(vec_dot_type);
+
+        // Initialize buffers for each activated expert
+        for (int idx = 0; idx < activated_count; ++idx) {
+            const int expert_id = activated_experts[idx];
+            const int M = matrix_row_counts[expert_id];
+
+            expert_bufs[idx].M = M;
+            expert_bufs[idx].expert_id = expert_id;
+            expert_bufs[idx].quantized_input.resize(M * row_size_A);
+            expert_bufs[idx].output.resize(M * N);
+        }
+
+        // Phase 1: Parallel quantization across all experts
+        // Work unit: one token quantization
+        int total_tokens = 0;
+        for (int idx = 0; idx < activated_count; ++idx) {
+            total_tokens += expert_bufs[idx].M;
+        }
+
+        parallel_for_ggml(params, total_tokens, [&](int begin, int end) {
+            // Map linear token index to (expert_idx, token_in_expert)
+            for (int global_token_idx = begin; global_token_idx < end; ++global_token_idx) {
+                int cumulative = 0;
+                int expert_idx = 0;
+                int local_token_idx = global_token_idx;
+
+                // Find which expert this token belongs to
+                for (expert_idx = 0; expert_idx < activated_count; ++expert_idx) {
+                    if (global_token_idx < cumulative + expert_bufs[expert_idx].M) {
+                        local_token_idx = global_token_idx - cumulative;
+                        break;
+                    }
+                    cumulative += expert_bufs[expert_idx].M;
+                }
+
+                const int expert_id = expert_bufs[expert_idx].expert_id;
+                const struct mmid_row_mapping * token_mappings =
+                    matrix_rows + expert_id * ids->ne[0] * ids->ne[1];
+
+                const struct mmid_row_mapping map = token_mappings[local_token_idx];
+                const int slot_index = map.i1;
+                const int batch_idx = map.i2;
+
+                // Bounds checking
+                if (slot_index < 0 || slot_index >= src1->ne[1] ||
+                    batch_idx < 0 || batch_idx >= src1->ne[2]) {
+                    continue;
+                }
+
+                // Source: float data from src1
+                const int64_t i11 = slot_index % src1->ne[1];
+                const int64_t i12 = batch_idx;
+                const float * src_row = (const float *)((char *)src1->data +
+                                                        i11*src1->nb[1] + i12*src1->nb[2]);
+
+                // Destination: quantized buffer for this expert
+                char * dst_row = expert_bufs[expert_idx].quantized_input.data() +
+                                local_token_idx * row_size_A;
+
+                // Quantize
+                from_float<vec_dot_type>(src_row, dst_row, K);
+            }
+        });
+
+        // Phase 2: Parallel AMX computation across all expert tiles
+        // Work unit: one (MB, NB) tile across all experts
+        constexpr int BLOCK_M = TILE_M * 2;
+        constexpr int BLOCK_N = TILE_N * 2;
+
+        // Calculate total work: sum of (MB * NB) for all experts
+        struct expert_work_info {
+            int expert_idx;
+            int expert_id;
+            int MB;
+            int NB;
+            int work_offset;  // cumulative work before this expert
+        };
+
+        std::vector<expert_work_info> work_info(activated_count);
+        int total_work = 0;
+
+        for (int idx = 0; idx < activated_count; ++idx) {
+            const int M = expert_bufs[idx].M;
+            const int MB = div_up(M, BLOCK_M);
+            const int NB = div_up(N, BLOCK_N);
+
+            work_info[idx].expert_idx = idx;
+            work_info[idx].expert_id = expert_bufs[idx].expert_id;
+            work_info[idx].MB = MB;
+            work_info[idx].NB = NB;
+            work_info[idx].work_offset = total_work;
+
+            total_work += MB * NB;
+        }
+
+        parallel_for_ggml(params, total_work, [&](int begin, int end) {
+            // Initialize tile config for each thread
+            ggml_tile_config_init();
+
+            const int KB = K / blck_size;
+            const int TILE_SIZE = get_tile_size<type>();
+            const int row_size_A_local = KB * sizeof(vec_dot_type);
+
+            for (int work_idx = begin; work_idx < end; ++work_idx) {
+                // Binary search to find which expert this work belongs to
+                int expert_idx = 0;
+                for (int i = 0; i < activated_count; ++i) {
+                    if (work_idx < work_info[i].work_offset + work_info[i].MB * work_info[i].NB) {
+                        expert_idx = i;
+                        break;
+                    }
+                }
+
+                const auto & info = work_info[expert_idx];
+                const int local_work = work_idx - info.work_offset;
+                const int mb = local_work / info.NB;
+                const int nb = local_work % info.NB;
+
+                const int M = expert_bufs[expert_idx].M;
+                const int expert_id = info.expert_id;
+
+                int mb_start = mb * BLOCK_M;
+                int mb_size = std::min(BLOCK_M, M - mb_start);
+                int nb_start = nb * BLOCK_N;
+                int nb_size = BLOCK_N;
+
+                // Expert weights
+                const char * expert_weights = (const char *)src0->data + expert_id * nb02;
+
+                // Output to this expert's buffer
+                float * out = expert_bufs[expert_idx].output.data() + mb_start * N + nb_start;
+
+                // Input from this expert's quantized buffer
+                const char * quantized_input = expert_bufs[expert_idx].quantized_input.data();
+
+                tinygemm_kernel_amx<vec_dot_type, type, float, blck_size>(
+                    mb_size, nb_size, KB,
+                    quantized_input + mb_start * row_size_A_local,
+                    expert_weights + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
+                    out, N);
+            }
+        });
+
+        // Phase 3: Parallel scatter outputs to destination
+        parallel_for_ggml(params, total_tokens, [&](int begin, int end) {
+            for (int global_token_idx = begin; global_token_idx < end; ++global_token_idx) {
+                int cumulative = 0;
+                int expert_idx = 0;
+                int local_token_idx = global_token_idx;
+
+                // Find which expert this token belongs to
+                for (expert_idx = 0; expert_idx < activated_count; ++expert_idx) {
+                    if (global_token_idx < cumulative + expert_bufs[expert_idx].M) {
+                        local_token_idx = global_token_idx - cumulative;
+                        break;
+                    }
+                    cumulative += expert_bufs[expert_idx].M;
+                }
+
+                const int expert_id = expert_bufs[expert_idx].expert_id;
+                const struct mmid_row_mapping * token_mappings =
+                    matrix_rows + expert_id * ids->ne[0] * ids->ne[1];
+
+                const struct mmid_row_mapping map = token_mappings[local_token_idx];
+                const int slot_index = map.i1;
+                const int batch_idx = map.i2;
+
+                // Bounds checking
+                if (slot_index < 0 || slot_index >= dst->ne[1] ||
+                    batch_idx < 0 || batch_idx >= dst->ne[2]) {
+                    continue;
+                }
+
+                // Destination in output tensor
+                const int64_t i1 = slot_index;
+                const int64_t i2 = batch_idx;
+                float * dst_row = (float *)((char *)dst->data + i1*dst->nb[1] + i2*dst->nb[2]);
+
+                // Source in expert's output buffer
+                const float * src_row = expert_bufs[expert_idx].output.data() +
+                                       local_token_idx * N;
+
+                // Copy
+                memcpy(dst_row, src_row, N * sizeof(float));
+            }
+        });
+    });
+}
+
 #endif // if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
