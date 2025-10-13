@@ -2630,6 +2630,16 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
 // Performs: dst[expert_id] = src1[tokens] @ src0.T
 //          where tokens are the M tokens assigned to this expert
 //
+// Buffer pool for AMX MoE operations
+// NOTE: Only thread 0 calls ggml_backend_amx_mul_mat_moe_expert (see ggml-cpu.c:1752),
+// so thread_local is safe and provides buffer reuse across expert calls
+struct amx_moe_buffer_pool {
+    std::vector<char> quantized_input;
+    std::vector<float> output;
+    size_t quantized_capacity = 0;  // in bytes
+    size_t output_capacity = 0;     // in floats
+};
+
 void ggml_backend_amx_mul_mat_moe_expert(
     const ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -2649,39 +2659,65 @@ void ggml_backend_amx_mul_mat_moe_expert(
     const int N = dst->ne[0];  // output features (n_ff)
     const int K = src0->ne[0]; // input features (n_embd)
 
-    // Allocate temporary buffers (thread-safe, separate per expert)
-    // Note: This is a simplified implementation; production code should manage buffers more carefully
-    std::vector<char> quantized_input_buffer;
-    std::vector<float> output_buffer;
+    // Thread-local buffer pool for efficient buffer reuse across expert calls
+    // Only allocated/grown when needed, significantly reduces malloc/free overhead
+    thread_local amx_moe_buffer_pool buffer_pool;
 
     GGML_DISPATCH_QTYPES(TYPE, [&] {
         const size_t row_size_A = K / blck_size * sizeof(vec_dot_type);
 
-        // Allocate buffers
-        quantized_input_buffer.resize(M * row_size_A);
-        output_buffer.resize(M * N);
+        // Calculate required buffer sizes
+        const size_t required_quantized = M * row_size_A;  // in bytes
+        const size_t required_output = M * N;              // in floats
 
-        // Quantize M rows of input for this expert
-        if (params->ith == 0) {
-            for (int m = 0; m < M; ++m) {
-                const struct mmid_row_mapping map = token_mappings[m];
-                const int token_id = map.i1;     // token ID
-                const int batch_idx = map.i2;    // batch index
-
-                // Source: original float data from src1
-                const int64_t i11 = token_id % src1->ne[0];
-                const int64_t i12 = batch_idx;
-                const float * src_row = (const float *)((char *)src1->data + i12*src1->nb[1] + i11*src1->nb[0]);
-
-                // Destination: contiguous buffer for this expert
-                char * dst_row = quantized_input_buffer.data() + m * row_size_A;
-
-                // Quantize row to vec_dot_type
-                from_float<vec_dot_type>(src_row, dst_row, K);
-            }
+        // Grow buffers only if needed (amortized allocation)
+        if (buffer_pool.quantized_capacity < required_quantized) {
+            // Grow with 1.5x factor to reduce reallocations
+            const size_t new_capacity = std::max(required_quantized, buffer_pool.quantized_capacity * 3 / 2);
+            buffer_pool.quantized_input.resize(new_capacity);
+            buffer_pool.quantized_capacity = new_capacity;
+        }
+        if (buffer_pool.output_capacity < required_output) {
+            const size_t new_capacity = std::max(required_output, buffer_pool.output_capacity * 3 / 2);
+            buffer_pool.output.resize(new_capacity);
+            buffer_pool.output_capacity = new_capacity;
         }
 
-        ggml_barrier(params->threadpool);
+        // Use buffer pool (no allocation in steady state)
+        char * quantized_input_buffer = buffer_pool.quantized_input.data();
+        float * output_buffer = buffer_pool.output.data();
+
+        // Quantize M rows of input for this expert
+        // NOTE: Only thread 0 calls this function (see ggml-cpu.c line 1752), so no barriers needed
+        for (int m = 0; m < M; ++m) {
+            const struct mmid_row_mapping map = token_mappings[m];
+            const int slot_index = map.i1;   // expert slot index (0-7 for top-8 MoE)
+            const int batch_idx = map.i2;    // batch index
+
+            // Bounds checking
+            if (slot_index < 0 || slot_index >= src1->ne[1]) {
+                fprintf(stderr, "[AMX MOE ERROR] Invalid slot_index=%d (should be < %lld)\n",
+                        slot_index, (long long)src1->ne[1]);
+                continue;
+            }
+            if (batch_idx < 0 || batch_idx >= src1->ne[2]) {
+                fprintf(stderr, "[AMX MOE ERROR] Invalid batch_idx=%d (should be < %lld)\n",
+                        batch_idx, (long long)src1->ne[2]);
+                continue;
+            }
+
+            // Source: original float data from src1
+            // Match the original chunked implementation's indexing
+            const int64_t i11 = slot_index % src1->ne[1];
+            const int64_t i12 = batch_idx;
+            const float * src_row = (const float *)((char *)src1->data + i11*src1->nb[1] + i12*src1->nb[2]);
+
+            // Destination: contiguous buffer for this expert
+            char * dst_row = quantized_input_buffer + m * row_size_A;
+
+            // Quantize row to vec_dot_type
+            from_float<vec_dot_type>(src_row, dst_row, K);
+        }
 
         // AMX matmul: [M, K] @ [K, N] → [M, N]
         constexpr int BLOCK_M = TILE_M * 2;
@@ -2707,34 +2743,42 @@ void ggml_backend_amx_mul_mat_moe_expert(
                 int nb_size = BLOCK_N;
 
                 // Output to temporary contiguous buffer
-                float * out = output_buffer.data() + mb_start * N + nb_start;
+                float * out = output_buffer + mb_start * N + nb_start;
 
                 tinygemm_kernel_amx<vec_dot_type, type, float, blck_size>(
                     mb_size, nb_size, KB,
-                    (const char *)quantized_input_buffer.data() + mb_start * row_size_A,
+                    (const char *)quantized_input_buffer + mb_start * row_size_A,
                     (const char *)expert_weights + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
                     out, N);  // ldc = N for contiguous output
             }
         });
 
-        ggml_barrier(params->threadpool);
-
         // Scatter output back to correct token positions
-        if (params->ith == 0) {
-            for (int m = 0; m < M; ++m) {
-                const struct mmid_row_mapping map = token_mappings[m];
-                const int token_id = map.i1;     // token ID
-                const int batch_idx = map.i2;    // batch index
+        for (int m = 0; m < M; ++m) {
+            const struct mmid_row_mapping map = token_mappings[m];
+            const int slot_index = map.i1;   // expert slot index (0-7 for top-8 MoE)
+            const int batch_idx = map.i2;    // batch index
 
-                // Destination: dst[token_id, batch_idx]
-                const int64_t i1 = token_id % src1->ne[0];
-                const int64_t i2 = batch_idx;
-                float * dst_row = (float *)((char *)dst->data + i1*dst->nb[1] + i2*dst->nb[2]);
-
-                // Copy from output buffer
-                const float * src_row = output_buffer.data() + m * N;
-                memcpy(dst_row, src_row, N * sizeof(float));
+            // Bounds checking
+            if (slot_index < 0 || slot_index >= dst->ne[1]) {
+                fprintf(stderr, "[AMX MOE ERROR] Scatter: Invalid slot_index=%d (should be < %lld)\n",
+                        slot_index, (long long)dst->ne[1]);
+                continue;
             }
+            if (batch_idx < 0 || batch_idx >= dst->ne[2]) {
+                fprintf(stderr, "[AMX MOE ERROR] Scatter: Invalid batch_idx=%d (should be < %lld)\n",
+                        batch_idx, (long long)dst->ne[2]);
+                continue;
+            }
+
+            // Destination: match the original chunked implementation's indexing
+            const int64_t i1 = slot_index;
+            const int64_t i2 = batch_idx;
+            float * dst_row = (float *)((char *)dst->data + i1*dst->nb[1] + i2*dst->nb[2]);
+
+            // Copy from output buffer
+            const float * src_row = output_buffer + m * N;
+            memcpy(dst_row, src_row, N * sizeof(float));
         }
     });
 }
