@@ -17,6 +17,7 @@
 #include <cstdio>  // for GGML_ASSERT
 
 #include "repack.h"
+#include "amx/mmq.h"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
@@ -1932,6 +1933,23 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     auto OK = tensor_traits->repack(tensor, data, size);
     GGML_ASSERT(OK == 0);
     GGML_UNUSED(buffer);
+
+    // NUMA weight replication for MoE experts
+    // Check if this is a MoE expert tensor (3D tensor with ne[2] > 1)
+    if (tensor->ne[2] > 1) {
+        const int64_t num_experts = tensor->ne[2];
+        const size_t expert_stride = tensor->nb[2];
+
+        // Replicate each expert to socket-local NUMA nodes
+        for (int64_t expert_id = 0; expert_id < num_experts; expert_id++) {
+            const char * expert_data = (const char *)tensor->data + expert_id * expert_stride;
+            ggml_backend_amx_numa_replicate_expert(expert_id, expert_data, expert_stride);
+        }
+
+        // Print summary message
+        fprintf(stderr, "NUMA (CPU_REPACK): Replicated %ld experts (%ld bytes each) from %s\n",
+                num_experts, expert_stride, tensor->name);
+    }
 }
 
 static const char * ggml_backend_cpu_repack_buffer_type_get_name(ggml_backend_buffer_type_t buft) {

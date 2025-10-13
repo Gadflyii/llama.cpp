@@ -47,6 +47,10 @@ void ggml_backend_amx_mul_mat_moe_batch(
     const int64_t ne10,
     const int64_t nb02);
 
+// NUMA weight replication for CPU_REPACK backend
+// Called after weights are repacked to replicate across NUMA groups
+void ggml_backend_amx_numa_replicate_expert(int64_t expert_id, const void * data, size_t size);
+
 #ifdef __cplusplus
 }
 #endif

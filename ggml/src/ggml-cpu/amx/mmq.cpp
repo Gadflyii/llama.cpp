@@ -408,6 +408,11 @@ static void free_numa_moe_weights() {}
 
 #endif  // __gnu_linux__
 
+// Public API for CPU_REPACK backend to replicate expert weights
+void ggml_backend_amx_numa_replicate_expert(int64_t expert_id, const void * data, size_t size) {
+    replicate_expert_weight(expert_id, data, size);
+}
+
 // =============================================================================
 
 namespace {
