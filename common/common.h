@@ -67,32 +67,10 @@ int32_t cpu_get_num_physical_cores();
 int32_t cpu_get_num_math();
 
 //
-// NUMA replication params
+// NUMA replication params - types defined in numa_topology.h
 //
 
-enum numa_replicate_strategy {
-    NUMA_REPLICATE_NONE,        // No replication (default for backward compatibility)
-    NUMA_REPLICATE_AUTO,        // Auto-detect sockets and replicate per socket
-    NUMA_REPLICATE_PER_NODE,    // Replicate on every NUMA node
-    NUMA_REPLICATE_GROUPS,      // User-defined groups
-};
-
-enum numa_alloc_strategy {
-    NUMA_ALLOC_INTERLEAVED,     // Interleave pages across NUMA nodes in group (default)
-    NUMA_ALLOC_STRIPED,         // Stripe experts across NUMA nodes
-};
-
-struct numa_replication_config {
-    numa_replicate_strategy replicate = NUMA_REPLICATE_NONE;
-    numa_alloc_strategy alloc = NUMA_ALLOC_INTERLEAVED;
-    std::vector<std::vector<int>> groups;  // For NUMA_REPLICATE_GROUPS
-};
-
-// Forward declaration for topology
-struct numa_topology;
-
-// Print NUMA replication configuration for diagnostics
-void print_numa_replication_config(const numa_replication_config& config, const numa_topology& topo);
+#include "numa_topology.h"
 
 //
 // Common params

@@ -50,6 +50,10 @@ extern "C" {
     GGML_BACKEND_API void ggml_amx_moe_init(enum ggml_amx_moe_arch arch); // select AMX MoE architecture variant
     GGML_BACKEND_API enum ggml_amx_moe_arch ggml_get_amx_moe_arch(void);  // get current AMX MoE architecture
 
+    // NUMA weight replication for AMX MoE
+    GGML_BACKEND_API void ggml_backend_amx_numa_init(int replicate_mode, int alloc_mode, const char * groups_str);
+    GGML_BACKEND_API void ggml_backend_amx_numa_free(void);
+
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);
 

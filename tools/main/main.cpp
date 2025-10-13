@@ -5,6 +5,7 @@
 #include "sampling.h"
 #include "llama.h"
 #include "chat.h"
+#include "ggml-cpu.h"
 
 #include <cstdio>
 #include <cstring>
@@ -125,6 +126,26 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
     ggml_amx_moe_init(params.amx_arch);
+
+    // Initialize NUMA weight replication for MoE models
+    if (params.numa_replication.replicate != NUMA_REPLICATE_NONE) {
+        // Convert groups to comma-separated string
+        std::string groups_str;
+        if (params.numa_replication.replicate == NUMA_REPLICATE_GROUPS &&
+            !params.numa_replication.groups.empty() &&
+            !params.numa_replication.groups[0].empty()) {
+            for (size_t i = 0; i < params.numa_replication.groups[0].size(); i++) {
+                if (i > 0) groups_str += ",";
+                groups_str += std::to_string(params.numa_replication.groups[0][i]);
+            }
+        }
+
+        ggml_backend_amx_numa_init(
+            static_cast<int>(params.numa_replication.replicate),
+            static_cast<int>(params.numa_replication.alloc),
+            groups_str.empty() ? nullptr : groups_str.c_str()
+        );
+    }
 
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;

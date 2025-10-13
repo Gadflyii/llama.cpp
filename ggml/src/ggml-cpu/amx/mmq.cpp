@@ -11,6 +11,7 @@
 #include "simd-mappings.h"
 #include "quants.h"
 #include "ggml-quants.h"
+#include "ggml-cpu.h"
 #include <algorithm>
 #include <type_traits>
 #include <cstdlib>  // for std::getenv, std::atoi
@@ -18,7 +19,17 @@
 #if defined(__gnu_linux__)
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <numa.h>
+#include <numaif.h>
 #endif
+
+// NUMA weight replication support
+#include "common/numa_topology.h"
+#include <vector>
+#include <map>
+#include <string>
+#include <fstream>
+#include <sstream>
 
 #if (defined(_WIN32) || defined(_WIN64))
 #define RESTRICT __restrict
@@ -68,6 +79,336 @@ static int get_amx_vnni_threshold() {
     }
     return threshold;
 }
+
+// =============================================================================
+// NUMA Weight Replication for MoE
+// =============================================================================
+
+#if defined(__gnu_linux__)
+
+// Local implementation of NUMA topology detection to avoid dependency on common
+static numa_topology detect_numa_topology_local() {
+    numa_topology topo;
+
+    // Check if NUMA is available
+    if (numa_available() == -1) {
+        // Single NUMA node, single socket fallback
+        topo.n_numa_nodes = 1;
+        topo.n_sockets = 1;
+        topo.numa_to_socket[0] = 0;
+        topo.socket_to_numas[0] = {0};
+        return topo;
+    }
+
+    topo.n_numa_nodes = numa_num_configured_nodes();
+
+    // Detect socket affinity for each NUMA node
+    for (int numa = 0; numa < topo.n_numa_nodes; numa++) {
+        std::string cpulist_path = "/sys/devices/system/node/node" +
+                                   std::to_string(numa) + "/cpulist";
+
+        std::ifstream cpulist_file(cpulist_path);
+        if (!cpulist_file) {
+            topo.numa_to_socket[numa] = numa;
+            topo.socket_to_numas[numa].push_back(numa);
+            continue;
+        }
+
+        std::string cpulist_str;
+        std::getline(cpulist_file, cpulist_str);
+        cpulist_file.close();
+
+        // Extract first CPU number
+        int first_cpu = -1;
+        size_t dash_pos = cpulist_str.find('-');
+        size_t comma_pos = cpulist_str.find(',');
+
+        if (dash_pos != std::string::npos) {
+            first_cpu = std::stoi(cpulist_str.substr(0, dash_pos));
+        } else if (comma_pos != std::string::npos) {
+            first_cpu = std::stoi(cpulist_str.substr(0, comma_pos));
+        } else {
+            first_cpu = std::stoi(cpulist_str);
+        }
+
+        if (first_cpu < 0) {
+            topo.numa_to_socket[numa] = numa;
+            topo.socket_to_numas[numa].push_back(numa);
+            continue;
+        }
+
+        std::string socket_path = "/sys/devices/system/cpu/cpu" +
+                                  std::to_string(first_cpu) +
+                                  "/topology/physical_package_id";
+
+        std::ifstream socket_file(socket_path);
+        if (!socket_file) {
+            topo.numa_to_socket[numa] = numa;
+            topo.socket_to_numas[numa].push_back(numa);
+            continue;
+        }
+
+        int socket_id;
+        socket_file >> socket_id;
+        socket_file.close();
+
+        topo.numa_to_socket[numa] = socket_id;
+        topo.socket_to_numas[socket_id].push_back(numa);
+    }
+
+    topo.n_sockets = topo.socket_to_numas.size();
+    return topo;
+}
+
+// Local implementation of print functions
+static void print_numa_topology_local(const numa_topology& topo) {
+    fprintf(stderr, "NUMA Topology:\n");
+    fprintf(stderr, "  NUMA nodes: %d\n", topo.n_numa_nodes);
+    fprintf(stderr, "  Sockets: %d\n", topo.n_sockets);
+
+    for (const auto& [socket_id, numa_nodes] : topo.socket_to_numas) {
+        fprintf(stderr, "  Socket %d: NUMA [", socket_id);
+        for (size_t i = 0; i < numa_nodes.size(); i++) {
+            fprintf(stderr, "%d", numa_nodes[i]);
+            if (i < numa_nodes.size() - 1) fprintf(stderr, ",");
+        }
+        fprintf(stderr, "]\n");
+    }
+}
+
+static void print_numa_replication_config_local(const numa_replication_config& config, const numa_topology& topo) {
+    fprintf(stderr, "NUMA Replication Configuration:\n");
+    fprintf(stderr, "  Strategy: ");
+
+    switch (config.replicate) {
+        case NUMA_REPLICATE_NONE:
+            fprintf(stderr, "none (no replication)\n");
+            return;
+        case NUMA_REPLICATE_AUTO:
+            fprintf(stderr, "auto (socket-grouped)\n");
+            fprintf(stderr, "  Detected groups from topology:\n");
+            for (const auto& [socket_id, numa_nodes] : topo.socket_to_numas) {
+                fprintf(stderr, "    Group (Socket %d): NUMA [", socket_id);
+                for (size_t i = 0; i < numa_nodes.size(); i++) {
+                    fprintf(stderr, "%d", numa_nodes[i]);
+                    if (i < numa_nodes.size() - 1) fprintf(stderr, ",");
+                }
+                fprintf(stderr, "]\n");
+            }
+            break;
+        case NUMA_REPLICATE_PER_NODE:
+            fprintf(stderr, "per-node (replicate on every NUMA node)\n");
+            fprintf(stderr, "  Groups: %d groups (one per NUMA node)\n", topo.n_numa_nodes);
+            break;
+        case NUMA_REPLICATE_GROUPS:
+            fprintf(stderr, "groups (user-defined)\n");
+            break;
+    }
+
+    fprintf(stderr, "  Allocation strategy: ");
+    switch (config.alloc) {
+        case NUMA_ALLOC_INTERLEAVED:
+            fprintf(stderr, "interleaved (pages distributed across group)\n");
+            break;
+        case NUMA_ALLOC_STRIPED:
+            fprintf(stderr, "striped (experts mapped to NUMA nodes)\n");
+            break;
+    }
+}
+
+// NUMA group weight storage
+struct numa_group_weights {
+    std::vector<int> numa_nodes;           // NUMA nodes in this group
+    std::map<int64_t, void*> expert_data;  // expert_id -> weight data pointer
+    size_t bytes_per_expert;               // Size of each expert's weights
+};
+
+// Global NUMA weight replication state
+struct {
+    bool enabled = false;
+    numa_replication_config config;
+    numa_topology topo;
+    std::vector<numa_group_weights> groups;
+    std::map<int, int> numa_to_group;  // Quick lookup: NUMA node → group index
+} g_numa_moe_weights;
+
+// Determine NUMA groups based on config
+static std::vector<std::vector<int>> determine_numa_groups(
+    const numa_replication_config& config,
+    const numa_topology& topo
+) {
+    std::vector<std::vector<int>> groups;
+
+    switch (config.replicate) {
+        case NUMA_REPLICATE_NONE:
+            // No replication
+            break;
+
+        case NUMA_REPLICATE_AUTO:
+            // Group by socket
+            for (const auto& [socket_id, numa_nodes] : topo.socket_to_numas) {
+                groups.push_back(numa_nodes);
+            }
+            break;
+
+        case NUMA_REPLICATE_PER_NODE:
+            // One group per NUMA node
+            for (int numa = 0; numa < topo.n_numa_nodes; numa++) {
+                groups.push_back({numa});
+            }
+            break;
+
+        case NUMA_REPLICATE_GROUPS:
+            // User-defined groups
+            groups = config.groups;
+            break;
+    }
+
+    return groups;
+}
+
+// Allocate expert weights for a NUMA group with interleaved strategy
+static void* allocate_expert_interleaved(const std::vector<int>& numa_nodes, size_t size) {
+    // Create bitmask for this group's NUMA nodes
+    struct bitmask* group_mask = numa_allocate_nodemask();
+    for (int numa : numa_nodes) {
+        numa_bitmask_setbit(group_mask, numa);
+    }
+
+    // Set interleave policy for this allocation
+    numa_set_interleave_mask(group_mask);
+    void* ptr = numa_alloc_interleaved(size);
+    numa_bitmask_free(group_mask);
+
+    return ptr;
+}
+
+// Allocate expert weights for a NUMA group with striped strategy
+static void* allocate_expert_striped(const std::vector<int>& numa_nodes, int expert_id, size_t size) {
+    // Stripe: Expert N → NUMA node (N % num_nodes)
+    int numa_id = numa_nodes[expert_id % numa_nodes.size()];
+    return numa_alloc_onnode(size, numa_id);
+}
+
+// Initialize NUMA weight replication from config
+static void init_numa_moe_weights(const numa_replication_config& config) {
+    g_numa_moe_weights.config = config;
+    g_numa_moe_weights.topo = detect_numa_topology_local();
+
+    if (g_numa_moe_weights.config.replicate == NUMA_REPLICATE_NONE) {
+        g_numa_moe_weights.enabled = false;
+        return;
+    }
+
+    // Determine groups
+    auto group_lists = determine_numa_groups(g_numa_moe_weights.config, g_numa_moe_weights.topo);
+
+    for (const auto& group_nodes : group_lists) {
+        numa_group_weights gw;
+        gw.numa_nodes = group_nodes;
+        gw.bytes_per_expert = 0;  // Will be set during weight loading
+        g_numa_moe_weights.groups.push_back(gw);
+
+        // Build lookup table
+        for (int numa : group_nodes) {
+            g_numa_moe_weights.numa_to_group[numa] = g_numa_moe_weights.groups.size() - 1;
+        }
+    }
+
+    g_numa_moe_weights.enabled = true;
+
+    // Print configuration
+    fprintf(stderr, "\n");
+    print_numa_topology_local(g_numa_moe_weights.topo);
+    fprintf(stderr, "\n");
+    print_numa_replication_config_local(g_numa_moe_weights.config, g_numa_moe_weights.topo);
+    fprintf(stderr, "\n");
+}
+
+// Replicate expert weight data across NUMA groups
+static void replicate_expert_weight(int64_t expert_id, const void* source_data, size_t size) {
+    if (!g_numa_moe_weights.enabled) return;
+
+    for (auto& group : g_numa_moe_weights.groups) {
+        // Allocate memory for this expert on this group
+        void* replica = nullptr;
+
+        if (g_numa_moe_weights.config.alloc == NUMA_ALLOC_INTERLEAVED) {
+            replica = allocate_expert_interleaved(group.numa_nodes, size);
+        } else {  // NUMA_ALLOC_STRIPED
+            replica = allocate_expert_striped(group.numa_nodes, expert_id, size);
+        }
+
+        if (replica) {
+            // Copy weight data to the replica
+            memcpy(replica, source_data, size);
+            group.expert_data[expert_id] = replica;
+            group.bytes_per_expert = size;
+        }
+    }
+}
+
+// Get NUMA-aware expert weight pointer for current thread
+static const void* get_numa_expert_weight(int64_t expert_id, const void* fallback_ptr) {
+    if (!g_numa_moe_weights.enabled) {
+        return fallback_ptr;
+    }
+
+    // Determine which NUMA node this thread is running on
+    int numa_id = numa_node_of_cpu(sched_getcpu());
+
+    // Look up the corresponding group
+    auto it = g_numa_moe_weights.numa_to_group.find(numa_id);
+    if (it == g_numa_moe_weights.numa_to_group.end()) {
+        // Fallback if NUMA node not found
+        return fallback_ptr;
+    }
+
+    int group_id = it->second;
+    auto& group = g_numa_moe_weights.groups[group_id];
+
+    // Look up the expert weight in this group
+    auto expert_it = group.expert_data.find(expert_id);
+    if (expert_it == group.expert_data.end()) {
+        // Fallback if expert not replicated yet
+        return fallback_ptr;
+    }
+
+    return expert_it->second;
+}
+
+// Free all NUMA-replicated weights
+static void free_numa_moe_weights() {
+    if (!g_numa_moe_weights.enabled) return;
+
+    for (auto& group : g_numa_moe_weights.groups) {
+        for (auto& [expert_id, ptr] : group.expert_data) {
+            if (ptr) {
+                numa_free(ptr, group.bytes_per_expert);
+            }
+        }
+        group.expert_data.clear();
+    }
+    g_numa_moe_weights.groups.clear();
+    g_numa_moe_weights.numa_to_group.clear();
+    g_numa_moe_weights.enabled = false;
+}
+
+#else  // !__gnu_linux__
+
+// Stub implementations for non-Linux platforms
+static void init_numa_moe_weights(const numa_replication_config& config) { (void)config; }
+static void replicate_expert_weight(int64_t expert_id, const void* source_data, size_t size) {
+    (void)expert_id; (void)source_data; (void)size;
+}
+static const void* get_numa_expert_weight(int64_t expert_id, const void* fallback_ptr) {
+    (void)expert_id; return fallback_ptr;
+}
+static void free_numa_moe_weights() {}
+
+#endif  // __gnu_linux__
+
+// =============================================================================
 
 namespace {
 
@@ -2383,6 +2724,21 @@ void ggml_backend_amx_convert_weight(struct ggml_tensor * tensor, const void * d
     GGML_DISPATCH_QTYPES(TYPE, [&] {
         convert_B_packed_format<type, blck_size>((void *)((char *)tensor->data + offset), (const type *)data, N, K);
     });
+
+    // NUMA weight replication for MoE experts
+    // ne[2] represents number of experts in MoE tensors
+    if (tensor->ne[2] > 1 && g_numa_moe_weights.enabled) {
+        const int64_t num_experts = tensor->ne[2];
+        const size_t expert_stride = tensor->nb[2];  // bytes per expert
+
+        for (int64_t expert_id = 0; expert_id < num_experts; expert_id++) {
+            const char * expert_data = (const char *)tensor->data + expert_id * expert_stride;
+            replicate_expert_weight(expert_id, expert_data, expert_stride);
+        }
+
+        fprintf(stderr, "NUMA: Replicated %ld experts (%ld bytes each) across %ld groups\n",
+                num_experts, expert_stride, g_numa_moe_weights.groups.size());
+    }
 }
 
 size_t ggml_backend_amx_desired_wsize(const struct ggml_tensor * dst) {
@@ -2969,8 +3325,9 @@ void ggml_backend_amx_mul_mat_moe_batch(
                 int nb_start = nb * BLOCK_N;
                 int nb_size = BLOCK_N;
 
-                // Expert weights
-                const char * expert_weights = (const char *)src0->data + expert_id * nb02;
+                // Expert weights - NUMA-aware (socket-local if enabled)
+                const char * expert_weights_base = (const char *)src0->data + expert_id * nb02;
+                const char * expert_weights = (const char *)get_numa_expert_weight(expert_id, expert_weights_base);
 
                 // Output to this expert's buffer
                 float * out = expert_bufs[expert_idx].output.data() + mb_start * N + nb_start;
@@ -3030,6 +3387,51 @@ void ggml_backend_amx_mul_mat_moe_batch(
             }
         });
     });
+}
+
+// =============================================================================
+// Public NUMA API Implementation
+// =============================================================================
+
+void ggml_backend_amx_numa_init(int replicate_mode, int alloc_mode, const char * groups_str) {
+#if defined(__gnu_linux__)
+    // Build config from parameters
+    numa_replication_config config;
+    config.replicate = (numa_replicate_strategy)replicate_mode;
+    config.alloc = (numa_alloc_strategy)alloc_mode;
+
+    // Parse groups string (comma-separated list like "0,1")
+    if (groups_str != nullptr && strlen(groups_str) > 0) {
+        std::vector<int> group_nodes;
+        std::string groups_input(groups_str);
+        size_t pos = 0;
+        while ((pos = groups_input.find(',')) != std::string::npos) {
+            int node = std::stoi(groups_input.substr(0, pos));
+            group_nodes.push_back(node);
+            groups_input.erase(0, pos + 1);
+        }
+        // Last token
+        if (!groups_input.empty()) {
+            group_nodes.push_back(std::stoi(groups_input));
+        }
+        if (!group_nodes.empty()) {
+            config.groups.push_back(group_nodes);
+        }
+    }
+
+    init_numa_moe_weights(config);
+#else
+    // Silence unused parameter warnings on non-Linux platforms
+    (void)replicate_mode;
+    (void)alloc_mode;
+    (void)groups_str;
+#endif
+}
+
+void ggml_backend_amx_numa_free() {
+#if defined(__gnu_linux__)
+    free_numa_moe_weights();
+#endif
 }
 
 #endif // if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
