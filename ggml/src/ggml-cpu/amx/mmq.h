@@ -11,6 +11,14 @@ struct mmid_row_mapping {
     int32_t i2;  // Batch index
 };
 
+// Token sorting buffers for cache-friendly expert processing (SGLang optimization)
+struct token_sorting_buffers {
+    int32_t * sorted_token_ids;      // [M * topk] tokens reordered by expert
+    int32_t * expert_offsets;        // [n_experts + 1] cumulative token counts per expert
+    int32_t * expert_token_counts;   // [n_experts] number of tokens per expert
+    bool enabled;                    // Whether token sorting is active
+};
+
 size_t ggml_backend_amx_desired_wsize(const struct ggml_tensor * dst);
 
 size_t ggml_backend_amx_get_alloc_size(const struct ggml_tensor * tensor);
@@ -45,7 +53,8 @@ void ggml_backend_amx_mul_mat_moe_batch(
     const void * wdata,
     const size_t row_size,
     const int64_t ne10,
-    const int64_t nb02);
+    const int64_t nb02,
+    const struct token_sorting_buffers * token_sort);
 
 // NUMA weight replication for CPU_REPACK backend
 // Called after weights are repacked to replicate across NUMA groups

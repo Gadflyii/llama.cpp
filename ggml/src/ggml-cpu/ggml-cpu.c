@@ -1707,6 +1707,79 @@ static void ggml_compute_forward_mul_mat_id_amx_moe(
 }
 
 // Variant 3: FUSED_MOE (K_Transformers optimizations)
+
+// Token sorting buffers for cache-friendly expert processing (SGLang optimization)
+struct token_sorting_buffers {
+    int32_t * sorted_token_ids;      // [M * topk] tokens reordered by expert
+    int32_t * expert_offsets;        // [n_experts + 1] cumulative token counts per expert
+    int32_t * expert_token_counts;   // [n_experts] number of tokens per expert
+    bool enabled;                    // Whether token sorting is active
+};
+
+// Initialize token sorting buffers (SGLang moe_align_block_size pattern)
+// Sorts tokens by expert ID for cache-friendly contiguous memory access
+static void ggml_moe_init_token_sorting(
+    struct token_sorting_buffers * buffers,
+    const struct ggml_tensor * ids,
+    const int64_t * matrix_row_counts,
+    const struct mmid_row_mapping * matrix_rows,
+    const int * activated_experts,
+    int activated_count,
+    int n_experts,
+    int64_t total_tokens,
+    void ** wdata_ptr
+) {
+    if (total_tokens < 32) {  // Skip sorting for very small batches
+        buffers->enabled = false;
+        return;
+    }
+
+    buffers->enabled = true;
+
+    // Allocate buffers
+    buffers->sorted_token_ids = incr_ptr_aligned(wdata_ptr, total_tokens * sizeof(int32_t), sizeof(int64_t));
+    buffers->expert_offsets = incr_ptr_aligned(wdata_ptr, (n_experts + 1) * sizeof(int32_t), sizeof(int64_t));
+    buffers->expert_token_counts = incr_ptr_aligned(wdata_ptr, n_experts * sizeof(int32_t), sizeof(int64_t));
+
+    // Initialize expert_token_counts (already computed in matrix_row_counts)
+    for (int e = 0; e < n_experts; e++) {
+        buffers->expert_token_counts[e] = (int32_t)matrix_row_counts[e];
+    }
+
+    // Calculate cumulative offsets for each expert
+    buffers->expert_offsets[0] = 0;
+    for (int e = 0; e < n_experts; e++) {
+        buffers->expert_offsets[e + 1] = buffers->expert_offsets[e] + buffers->expert_token_counts[e];
+    }
+
+    // Sort tokens by expert: build sorted_token_ids array
+    // This creates contiguous token groups per expert for cache-friendly access
+    int32_t * current_offsets = alloca(n_experts * sizeof(int32_t));
+    memcpy(current_offsets, buffers->expert_offsets, n_experts * sizeof(int32_t));
+
+    // Iterate through all tokens and place them in sorted order by expert
+    const int n_expert_used = ids->ne[0];  // topk
+    const int n_tokens = ids->ne[1];       // batch size
+
+    for (int expert_idx = 0; expert_idx < n_experts; expert_idx++) {
+        if (matrix_row_counts[expert_idx] == 0) continue;
+
+        // Find all tokens assigned to this expert
+        const struct mmid_row_mapping * expert_rows = matrix_rows + expert_idx * n_expert_used * n_tokens;
+
+        for (int64_t tok = 0; tok < matrix_row_counts[expert_idx]; tok++) {
+            int32_t original_token_id = expert_rows[tok].i2;  // Batch index
+            int32_t expert_selection_id = expert_rows[tok].i1; // Which expert slot (0..topk-1)
+
+            // Store global token index (batch_idx * topk + selection_idx)
+            int32_t global_token_idx = original_token_id * n_expert_used + expert_selection_id;
+
+            int32_t sorted_position = current_offsets[expert_idx]++;
+            buffers->sorted_token_ids[sorted_position] = global_token_idx;
+        }
+    }
+}
+
 static void ggml_compute_forward_mul_mat_id_amx_fused_moe(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -1741,6 +1814,27 @@ static void ggml_compute_forward_mul_mat_id_amx_fused_moe(
 
     const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+    // Optimization #3: Token sorting for cache-friendly expert processing
+    // Initialize token sorting buffers (SGLang pattern)
+    struct token_sorting_buffers token_sort;
+    void * wdata_sort = params->wdata;
+
+    if (ith == 0 && total_tokens >= 32) {
+        ggml_moe_init_token_sorting(
+            &token_sort,
+            ids,
+            matrix_row_counts,
+            matrix_rows,
+            activated_experts,
+            activated_count,
+            n_as,
+            total_tokens,
+            &wdata_sort
+        );
+    }
+
+    ggml_barrier(params->threadpool);
 
     // Optimization #5: Separate decode path
     // For decode (small total tokens and few active experts), use sequential processing
@@ -1793,7 +1887,8 @@ static void ggml_compute_forward_mul_mat_id_amx_fused_moe(
             const void * wdata,
             const size_t row_size,
             const int64_t ne10,
-            const int64_t nb02);
+            const int64_t nb02,
+            const struct token_sorting_buffers * token_sort);
 
         ggml_backend_amx_mul_mat_moe_batch(
             params, dst, src0, src1, ids,
@@ -1804,7 +1899,8 @@ static void ggml_compute_forward_mul_mat_id_amx_fused_moe(
             wdata,
             row_size,
             ne10,
-            nb02
+            nb02,
+            &token_sort
         );
     }
 }

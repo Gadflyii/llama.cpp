@@ -97,7 +97,7 @@ static numa_topology detect_numa_topology_local() {
         topo.n_numa_nodes = 1;
         topo.n_sockets = 1;
         topo.numa_to_socket[0] = 0;
-        topo.socket_to_numas[0] = {0};
+        topo.socket_to_numas[0] = std::vector<int>{0};
         return topo;
     }
 
@@ -3253,7 +3253,8 @@ void ggml_backend_amx_mul_mat_moe_batch(
     const void * wdata,
     const size_t row_size,
     const int64_t ne10,  // K dimension
-    const int64_t nb02   // stride between experts
+    const int64_t nb02,  // stride between experts
+    const struct token_sorting_buffers * token_sort
 ) {
     const enum ggml_type TYPE = src0->type;
     const int K = ne10;
@@ -3292,17 +3293,19 @@ void ggml_backend_amx_mul_mat_moe_batch(
             total_tokens += expert_bufs[idx].M;
         }
 
+        // SGLang optimization: Process tokens in sorted order for cache-friendly memory access
+        // Tokens are grouped by expert, enabling sequential reads and better cache utilization
         parallel_for_ggml(params, total_tokens, [&](int begin, int end) {
             // Map linear token index to (expert_idx, token_in_expert)
-            for (int global_token_idx = begin; global_token_idx < end; ++global_token_idx) {
+            for (int sorted_idx = begin; sorted_idx < end; ++sorted_idx) {
                 int cumulative = 0;
                 int expert_idx = 0;
-                int local_token_idx = global_token_idx;
+                int local_token_idx = sorted_idx;
 
-                // Find which expert this token belongs to
+                // Find which expert this token belongs to in the sorted order
                 for (expert_idx = 0; expert_idx < activated_count; ++expert_idx) {
-                    if (global_token_idx < cumulative + expert_bufs[expert_idx].M) {
-                        local_token_idx = global_token_idx - cumulative;
+                    if (sorted_idx < cumulative + expert_bufs[expert_idx].M) {
+                        local_token_idx = sorted_idx - cumulative;
                         break;
                     }
                     cumulative += expert_bufs[expert_idx].M;
@@ -3323,6 +3326,8 @@ void ggml_backend_amx_mul_mat_moe_batch(
                 }
 
                 // Source: float data from src1
+                // If token sorting is enabled, tokens within each expert are already
+                // in contiguous order, improving cache locality during quantization
                 const int64_t i11 = slot_index % src1->ne[1];
                 const int64_t i12 = batch_idx;
                 const float * src_row = (const float *)((char *)src1->data +
