@@ -34,9 +34,14 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <signal.h>
+#include <stdatomic.h>
 #if defined(__gnu_linux__)
 #include <syscall.h>
 #endif
+
+// Debug flag for verbose fused MoE kernel logging
+// Set to 1 to enable detailed debugging output for NaN investigations
+#define DEBUG_FUSED_MOE_VERBOSE 0
 
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
@@ -2294,17 +2299,55 @@ static void ggml_compute_forward_mul_mat_gate_up_silu(
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
+    // Initialize buffers to zero (critical!) - only thread 0
+    if (ith == 0) {
+        memset(gate_result, 0, ggml_nbytes(dst));
+        memset(up_result, 0, ggml_nbytes(dst));
+        memset(dst->data, 0, ggml_nbytes(dst));
+        if (wdata_input) {
+            memset(wdata_input, 0, ggml_row_size(vec_dot_type, ggml_nelements(input)));
+        }
+    }
+
+    ggml_barrier(params->threadpool);  // Wait for buffer initialization
+
     // Step 1: Convert input to vec_dot_type if needed
+#if DEBUG_FUSED_MOE_VERBOSE
+    if (ith == 0) {
+        fprintf(stderr, "[CONV] input->type=%d, vec_dot_type=%d, needs_conversion=%d\n",
+                input->type, vec_dot_type, input->type != vec_dot_type);
+    }
+#endif
+
     if (input->type != vec_dot_type) {
         const size_t nbw0 = ggml_type_size(vec_dot_type);
         const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
         const size_t nbw2 = nbw1 * ne11;
+
+        if (ith == 0) {
+            fprintf(stderr, "[CONVERT] Starting conversion: ne12=%ld, ne11=%ld, ne10=%ld, bs=%ld\n",
+                    ne12, ne11, ne10, ggml_blck_size(vec_dot_type));
+        }
 
         for (int64_t i12 = 0; i12 < ne12; ++i12) {
             for (int64_t i11 = 0; i11 < ne11; ++i11) {
                 size_t bs = ggml_blck_size(vec_dot_type);
                 int64_t ne10_block_start = (ith * ne10/bs) / nth;
                 int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+
+                if (ith == 0 && i11 == 0) {
+                    fprintf(stderr, "[CONVERT] Thread %d, i12=%ld: block_start=%ld, block_end=%ld, elements=%ld\n",
+                            ith, i12, ne10_block_start, ne10_block_end, (ne10_block_end - ne10_block_start) * bs);
+
+                    // Check first few input values being converted
+                    const float * src_ptr = (float *)((char *) input->data + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10);
+                    const char * dst_ptr = wdata_input + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0;
+                    fprintf(stderr, "[CONVERT_INPUT] i12=%ld, dst_offset=%ld, First 5 F32: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+                            i12, dst_ptr - wdata_input,
+                            (double)src_ptr[0], (double)src_ptr[1], (double)src_ptr[2],
+                            (double)src_ptr[3], (double)src_ptr[4]);
+                }
+
                 from_float(
                     (float *)((char *) input->data + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
                     (void *)(wdata_input + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
@@ -2312,6 +2355,34 @@ static void ggml_compute_forward_mul_mat_gate_up_silu(
                 );
             }
         }
+
+        if (ith == 0) {
+            fprintf(stderr, "[CONVERT] Conversion complete\n");
+        }
+    }
+
+    ggml_barrier(params->threadpool);  // Wait for input conversion
+
+    // Debug: Check original input and converted data RIGHT AFTER CONVERSION
+    if (ith == 0 && wdata_input) {
+        const float * orig_input = (const float *)input->data;
+        fprintf(stderr, "[POST_CONV_CHECK] F32 input[0-4]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+                (double)orig_input[0], (double)orig_input[1], (double)orig_input[2],
+                (double)orig_input[3], (double)orig_input[4]);
+
+        // Check converted Q8_0 scale for first block
+        typedef struct { uint16_t d; int8_t qs[32]; } block_q8_0_simple;
+        const block_q8_0_simple * first_block = (const block_q8_0_simple *)wdata_input;
+        fprintf(stderr, "[POST_CONV_CHECK] Q8_0 scale_fp16=0x%04x (should NOT be 0x7e00!)\n",
+                first_block->d);
+
+        // Also show raw bytes
+        const unsigned char * wdata_bytes = (const unsigned char *)wdata_input;
+        fprintf(stderr, "[POST_CONV_CHECK] First 16 bytes (hex): ");
+        for (int i = 0; i < 16; i++) {
+            fprintf(stderr, "%02x ", wdata_bytes[i]);
+        }
+        fprintf(stderr, "\n");
     }
 
     // Step 2: Build matrix_row_counts and matrix_rows (thread 0 only)
@@ -2363,12 +2434,36 @@ static void ggml_compute_forward_mul_mat_gate_up_silu(
     // Step 3: Compute gate projection
     // For now, we'll use a simple fallback implementation
     // A full AMX-optimized version would go here
+    if (ith == 0) {
+        int active_experts = 0;
+        for (int i = 0; i < n_as; i++) if (matrix_row_counts[i] > 0) active_experts++;
+        fprintf(stderr, "[GEMM_START] Starting gate projection, active_experts=%d\n", active_experts);
+    }
+
     for (int64_t i02 = ith; i02 < n_as; i02 += nth) {
         const int64_t token_count = matrix_row_counts[i02];
         if (token_count == 0) continue;
 
-        // Get pointers
-        const void * gate_expert = (const char *) gate_weights->data + i02 * nb02;
+        // Get pointers - check for repacked data
+        const void * gate_weights_data = gate_weights->data;
+
+        // If weights are in repack buffer, use the buffer's base pointer
+        if (gate_weights->buffer) {
+            gate_weights_data = ggml_backend_buffer_get_base(gate_weights->buffer);
+        }
+
+        const void * gate_expert = (const char *) gate_weights_data + i02 * nb02;
+
+        // Track if this is the FIRST expert being processed (for debug)
+        static _Atomic int first_expert_seen = 0;
+        bool is_first_expert = false;
+        if (ith == 0) {
+            int expected = 0;
+            is_first_expert = atomic_compare_exchange_strong(&first_expert_seen, &expected, 1);
+            if (is_first_expert) {
+                fprintf(stderr, "[GEMM_EXPERT] FIRST EXPERT i02=%ld, token_count=%ld\n", i02, token_count);
+            }
+        }
 
         // Process each token for this expert
         for (int64_t t = 0; t < token_count; ++t) {
@@ -2386,13 +2481,211 @@ static void ggml_compute_forward_mul_mat_gate_up_silu(
                 ((const char *) input->data + iid1 * nb12) :
                 (wdata_input + iid1 * ggml_row_size(vec_dot_type, ne10));
 
+            // Debug first GEMM call from FIRST expert
+            if (ith == 0 && is_first_expert && t == 0) {
+                fprintf(stderr, "[GEMM_GATE] expert=%ld (i02), token_id=%d, iid1=%ld, ne00=%ld, ne01=%ld\n",
+                        i02, id, iid1, ne00, ne01);
+                fprintf(stderr, "[GEMM_GATE] gate_weights->data=%p, gate_expert=%p, offset=%ld bytes\n",
+                        gate_weights->data, gate_expert, (const char *)gate_expert - (const char *)gate_weights->data);
+                fprintf(stderr, "[GEMM_GATE] nb02=%ld (expert stride), expected=%ld (ne01*nb01)\n",
+                        nb02, ne01 * nb01);
+                fprintf(stderr, "[GEMM_GATE] Calculation: i02=%ld * nb02=%ld = %ld bytes offset\n",
+                        i02, nb02, i02 * nb02);
+                fprintf(stderr, "[GEMM_GATE] inp=%p, gate_out=%p\n",
+                        inp, (void*)gate_out);
+                fprintf(stderr, "[GEMM_GATE] wdata_input=%p, input->type=%d, vec_dot_type=%d\n",
+                        (void*)wdata_input, input->type, vec_dot_type);
+                fprintf(stderr, "[GEMM_GATE] using_wdata=%d, offset=%ld bytes\n",
+                        input->type != vec_dot_type, iid1 * ggml_row_size(vec_dot_type, ne10));
+                fprintf(stderr, "[GEMM_GATE] nb01=%ld, expected=%ld\n",
+                        nb01, ggml_row_size(gate_weights->type, ne00));
+
+                // Check if gate_weights has valid data - show raw bytes
+                const unsigned char * weight_bytes = (const unsigned char *)gate_expert;
+                fprintf(stderr, "[GATE_WEIGHT] type=%d, first 16 bytes (hex): ", gate_weights->type);
+                for (int i = 0; i < 16; i++) {
+                    fprintf(stderr, "%02x ", weight_bytes[i]);
+                }
+                fprintf(stderr, "\n");
+
+                // Check first few Q4_0 blocks for invalid scales
+                typedef struct { uint16_t d; uint8_t qs[16]; } block_q4_0_simple;
+                const block_q4_0_simple * q4_blocks = (const block_q4_0_simple *)gate_expert;
+                fprintf(stderr, "[GATE_WEIGHT] First 5 Q4_0 block scales: 0x%04x, 0x%04x, 0x%04x, 0x%04x, 0x%04x\n",
+                        q4_blocks[0].d, q4_blocks[1].d, q4_blocks[2].d, q4_blocks[3].d, q4_blocks[4].d);
+
+                // Print first block's nibbles
+                fprintf(stderr, "[GATE_WEIGHT] First Q4_0 block nibbles (first 8 bytes = 16 nibbles): ");
+                for (int i = 0; i < 8; i++) {
+                    uint8_t byte = q4_blocks[0].qs[i];
+                    fprintf(stderr, "%x%x ", byte & 0xf, (byte >> 4) & 0xf);
+                }
+                fprintf(stderr, "\n");
+
+                // Check for inf/nan scales
+                for (int b = 0; b < 5; b++) {
+                    uint16_t scale = q4_blocks[b].d;
+                    if (scale == 0x7c00) {
+                        fprintf(stderr, "[GATE_WEIGHT] Block %d has +inf scale!\n", b);
+                    } else if (scale == 0xfc00) {
+                        fprintf(stderr, "[GATE_WEIGHT] Block %d has -inf scale!\n", b);
+                    } else if ((scale & 0x7c00) == 0x7c00 && (scale & 0x03ff) != 0) {
+                        fprintf(stderr, "[GATE_WEIGHT] Block %d has NaN scale!\n", b);
+                    }
+                }
+            }
+
             // Simple fallback: use existing vec_dot function
             // TODO: Replace with AMX-optimized path
             ggml_vec_dot_t vec_dot = type_traits_cpu[gate_weights->type].vec_dot;
+
+            if (ith == 0 && is_first_expert && t == 0) {
+                fprintf(stderr, "[VEC_DOT_PTR] gate_weights->type=%d, vec_dot=%p\n",
+                        gate_weights->type, (void*)vec_dot);
+                fprintf(stderr, "[VEC_DOT_PTR] Expected Q4_0 type=%d\n", GGML_TYPE_Q4_0);
+
+                // Check Q8_0 input data at inp pointer
+                typedef struct { uint16_t d; int8_t qs[32]; } block_q8_0_simple;
+                const block_q8_0_simple * inp_blocks = (const block_q8_0_simple *)inp;
+                fprintf(stderr, "[INP_CHECK] inp=%p, Q8_0 scale_fp16=0x%04x\n",
+                        inp, inp_blocks[0].d);
+                fprintf(stderr, "[INP_CHECK] First 16 Q8_0 bytes: ");
+                const unsigned char * inp_bytes = (const unsigned char *)inp;
+                for (int i = 0; i < 16; i++) {
+                    fprintf(stderr, "%02x ", inp_bytes[i]);
+                }
+                fprintf(stderr, "\n");
+                fprintf(stderr, "[INP_CHECK] ne00=%ld (elements for dot product)\n", ne00);
+
+                // Check ALL Q8_0 blocks for invalid scales
+                int num_q8_blocks = ne00 / 32;  // 2048/32 = 64
+                int invalid_scales = 0;
+                for (int b = 0; b < num_q8_blocks; b++) {
+                    uint16_t scale = inp_blocks[b].d;
+                    if (scale == 0x7c00 || scale == 0xfc00 ||
+                        ((scale & 0x7c00) == 0x7c00 && (scale & 0x03ff) != 0)) {
+                        fprintf(stderr, "[INP_CHECK] Q8_0 block %d has invalid scale 0x%04x!\n", b, scale);
+                        invalid_scales++;
+                    }
+                }
+                if (invalid_scales == 0) {
+                    fprintf(stderr, "[INP_CHECK] All %d Q8_0 blocks have valid scales\n", num_q8_blocks);
+                }
+
+                // Print first block's quantized values
+                fprintf(stderr, "[INP_CHECK] First Q8_0 block quantized values (first 8): ");
+                for (int i = 0; i < 8; i++) {
+                    fprintf(stderr, "%d ", inp_blocks[0].qs[i]);
+                }
+                fprintf(stderr, "\n");
+
+                // MANUAL TEST: Create simple test data
+                // Create a simple Q8_0 block: scale=1.0, all values = 1
+                typedef struct { uint16_t d; int8_t qs[32]; } test_block_q8_0;
+                test_block_q8_0 test_q8;
+                test_q8.d = 0x3c00;  // FP16 for 1.0
+                for (int i = 0; i < 32; i++) test_q8.qs[i] = 1;
+
+                // Create a simple Q4_0 block: scale=1.0, all nibbles = 8 (which becomes 0 after offset)
+                typedef struct { uint16_t d; uint8_t qs[16]; } test_block_q4_0;
+                test_block_q4_0 test_q4;
+                test_q4.d = 0x3c00;  // FP16 for 1.0
+                for (int i = 0; i < 16; i++) test_q4.qs[i] = 0x88;  // Both nibbles = 8
+
+                float manual_test = -999.0f;
+                vec_dot(32, &manual_test, 0, &test_q4, 0, &test_q8, 0, 1);
+                fprintf(stderr, "[MANUAL_TEST] vec_dot with manual data: result=%.6f (should be 0.0)\n", (double)manual_test);
+
+                // PROGRESSIVE SIZE TEST: Test with increasing sizes to find when it fails
+                fprintf(stderr, "[SIZE_TEST] Testing vec_dot with increasing sizes:\n");
+                const int test_sizes[] = {32, 64, 128, 256, 512, 1024, 2048};
+                int num_tests = 7;
+                int first_fail_size = -1;
+
+                for (int i = 0; i < num_tests; i++) {
+                    int test_n = test_sizes[i];
+                    if (test_n > ne00) break;  // Don't test beyond available data
+
+                    float test_result = -999.0f;
+                    vec_dot(test_n, &test_result, 0,
+                            (const char *)gate_expert, 0,
+                            inp, 0, 1);
+
+                    if (isnan(test_result) || isinf(test_result)) {
+                        fprintf(stderr, "[SIZE_TEST] n=%d: FAILED (result=%.6f)\n", test_n, (double)test_result);
+                        if (first_fail_size < 0) first_fail_size = test_n;
+                        break;
+                    } else {
+                        fprintf(stderr, "[SIZE_TEST] n=%d: OK (result=%.6f)\n", test_n, (double)test_result);
+                    }
+                }
+
+                if (first_fail_size > 0) {
+                    fprintf(stderr, "[SIZE_TEST] First failure at n=%d elements (%d blocks)\n",
+                            first_fail_size, first_fail_size / 32);
+
+                    // If first block (32) works but later fails, check individual blocks
+                    if (first_fail_size > 32) {
+                        fprintf(stderr, "[BLOCK_TEST] Checking individual blocks from block 1 onwards:\n");
+                        for (int block = 1; block < first_fail_size / 32; block++) {
+                            float block_result = -999.0f;
+
+                            // Compute dot product of just this one block
+                            vec_dot(32, &block_result, 0,
+                                    (const char *)gate_expert + block * 18,  // 18 bytes per Q4_0 block
+                                    0,
+                                    (const char *)inp + block * 34,  // 34 bytes per Q8_0 block
+                                    0, 1);
+
+                            if (isnan(block_result) || isinf(block_result)) {
+                                fprintf(stderr, "[BLOCK_TEST] Block %d: FAILED (result=%.6f)\n",
+                                        block, (double)block_result);
+
+                                // Dump this block's data
+                                typedef struct { uint16_t d; uint8_t qs[16]; } block_q4_0_simple;
+                                typedef struct { uint16_t d; int8_t qs[32]; } block_q8_0_simple;
+                                const block_q4_0_simple * q4 = (const block_q4_0_simple *)((const char *)gate_expert + block * 18);
+                                const block_q8_0_simple * q8 = (const block_q8_0_simple *)((const char *)inp + block * 34);
+
+                                fprintf(stderr, "[BLOCK_TEST] Block %d Q4_0 scale: 0x%04x\n", block, q4->d);
+                                fprintf(stderr, "[BLOCK_TEST] Block %d Q8_0 scale: 0x%04x\n", block, q8->d);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Use local tmp buffer like MUL_MAT_ID does!
+            float tmp[768];  // Local stack buffer
+
+            // Try calling vec_dot with explicit check
             for (int64_t ir = 0; ir < ne01; ++ir) {
-                vec_dot(ne00, gate_out + ir, 0,
+                if (vec_dot == NULL) {
+                    fprintf(stderr, "[ERROR] vec_dot is NULL!\n");
+                    break;
+                }
+                vec_dot(ne00, &tmp[ir], 0,
                         (const char *)gate_expert + ir*nb01, 0,
                         inp, 0, 1);
+
+                // Check first result immediately
+                if (ith == 0 && is_first_expert && t == 0 && ir == 0) {
+                    fprintf(stderr, "[VEC_DOT_IMMEDIATE] tmp[0]=%.6f after first vec_dot\n", (double)tmp[0]);
+                }
+            }
+
+            // Copy from tmp to gate_out
+            memcpy(gate_out, tmp, ne01 * sizeof(float));
+
+            // Debug first result
+            if (ith == 0 && i02 == 0 && t == 0) {
+                fprintf(stderr, "[GATE_TMP] First 5 values: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+                        (double)tmp[0], (double)tmp[1], (double)tmp[2],
+                        (double)tmp[3], (double)tmp[4]);
+                fprintf(stderr, "[GATE_RESULT] First 5 values: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+                        (double)gate_out[0], (double)gate_out[1], (double)gate_out[2],
+                        (double)gate_out[3], (double)gate_out[4]);
             }
         }
     }
@@ -2404,7 +2697,13 @@ static void ggml_compute_forward_mul_mat_gate_up_silu(
         const int64_t token_count = matrix_row_counts[i02];
         if (token_count == 0) continue;
 
-        const void * up_expert = (const char *) up_weights->data + i02 * nb02;
+        // Check for repacked data
+        const void * up_weights_data = up_weights->data;
+        if (up_weights->buffer) {
+            up_weights_data = ggml_backend_buffer_get_base(up_weights->buffer);
+        }
+
+        const void * up_expert = (const char *) up_weights_data + i02 * nb02;
 
         for (int64_t t = 0; t < token_count; ++t) {
             struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(i02, t);
@@ -2421,31 +2720,61 @@ static void ggml_compute_forward_mul_mat_gate_up_silu(
                 ((const char *) input->data + iid1 * nb12) :
                 (wdata_input + iid1 * ggml_row_size(vec_dot_type, ne10));
 
+            // Use local tmp buffer like MUL_MAT_ID does!
+            float tmp[768];  // Local stack buffer
+
             ggml_vec_dot_t vec_dot = type_traits_cpu[up_weights->type].vec_dot;
             for (int64_t ir = 0; ir < ne01; ++ir) {
-                vec_dot(ne00, up_out + ir, 0,
+                vec_dot(ne00, &tmp[ir], 0,
                         (const char *)up_expert + ir*nb01, 0,
                         inp, 0, 1);
             }
+
+            // Copy from tmp to up_out
+            memcpy(up_out, tmp, ne01 * sizeof(float));
         }
     }
 
     ggml_barrier(params->threadpool);
 
     // Step 5: Apply SiLU + multiply fusion: dst = silu(gate) * up
-    // Only process the elements we actually computed (use n_ids, not ne1 which may be reshaped)
+    // Map from intermediate buffer [ne0, n_ids, ne2] to dst [ne0, ne1, ne2]
+    // Note: dst may have ne1=128 (full expert count) but we only write to first n_ids=8 slices
     const int64_t total_elements = ne0 * n_ids * ne2;
     const int64_t elements_per_thread = (total_elements + nth - 1) / nth;
     const int64_t start = ith * elements_per_thread;
     const int64_t end = (start + elements_per_thread < total_elements) ? (start + elements_per_thread) : total_elements;
 
-    float * dst_data = (float *) dst->data;
     for (int64_t i = start; i < end; ++i) {
+        // Convert linear index to 3D coordinates in intermediate buffer [ne0, n_ids, ne2]
+        const int64_t itoken = i / (ne0 * n_ids);
+        const int64_t remainder = i % (ne0 * n_ids);
+        const int64_t id = remainder / ne0;
+        const int64_t idim = remainder % ne0;
+
+        // Read from intermediate buffers (linear indexing)
         const float g = gate_result[i];
         const float u = up_result[i];
+
         // SiLU: silu(x) = x / (1 + exp(-x)) = x * sigmoid(x)
         const float silu_g = g / (1.0f + expf(-g));
-        dst_data[i] = silu_g * u;
+
+        // Write to dst using proper strides: dst[idim, id, itoken]
+        float * dst_ptr = (float *)((char *)dst->data + idim*nb0 + id*nb1 + itoken*nb2);
+        *dst_ptr = silu_g * u;
+
+        // Debug first few writes
+        if (ith == 0 && i < start + 3) {
+            fprintf(stderr, "[SILU] i=%ld: coords=(%ld,%ld,%ld), g=%.6f, u=%.6f, result=%.6f\n",
+                    i, idim, id, itoken, (double)g, (double)u, (double)(silu_g * u));
+        }
+    }
+
+    // Debug: Check first few dst values
+    if (ith == 0) {
+        float * dst_data = (float *)dst->data;
+        fprintf(stderr, "[DST] First values: dst[0]=%.6f, dst[768]=%.6f, dst[1536]=%.6f\n",
+                (double)dst_data[0], (double)dst_data[768], (double)dst_data[1536]);
     }
 }
 

@@ -1618,7 +1618,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 forward_mul_mat_id(params, op);
                 return true;
             case GGML_OP_MUL_MAT_GATE_UP_SILU:
-                return false;
+                forward_mul_mat_gate_up_silu(params, op);
+                return true;
             default:
                 // GGML_ABORT("fatal error");
                 break;
@@ -1826,6 +1827,153 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         src1_col, 1, src0_cur_end - src0_cur_start);
             }
         }
+#undef MMID_MATRIX_ROW
+    }
+
+    void forward_mul_mat_gate_up_silu(ggml_compute_params * params, ggml_tensor * op) {
+        const ggml_tensor * gate_weights = op->src[0];  // Q4_0, [dim_model, dim_ffn, n_experts]
+        const ggml_tensor * up_weights   = op->src[1];  // Q4_0, [dim_model, dim_ffn, n_experts]
+        const ggml_tensor * input        = op->src[2];  // F32, [dim_model, 1, n_tokens]
+        const ggml_tensor * ids          = op->src[3];  // I32, [n_experts_per_token, n_tokens]
+        ggml_tensor *       dst          = op;
+
+        const int64_t ne00 = gate_weights->ne[0];  // dim_model
+        const int64_t ne01 = gate_weights->ne[1];  // dim_ffn
+        const int64_t ne02 = gate_weights->ne[2];  // n_experts
+
+        const int64_t ne10 = input->ne[0];  // dim_model
+        const int64_t ne11 = input->ne[1];  // 1
+        const int64_t ne12 = input->ne[2];  // n_tokens
+
+        const size_t nb00 = gate_weights->nb[0];
+        const size_t nb02 = gate_weights->nb[2];
+
+        const size_t nb10 = input->nb[0];
+        const size_t nb11 = input->nb[1];
+        const size_t nb12 = input->nb[2];
+
+        const size_t nb0 = dst->nb[0];
+        const size_t nb1 = dst->nb[1];
+        const size_t nb2 = dst->nb[2];
+
+        const int ith = params->ith;
+        const int nth = params->nth;
+
+        const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
+
+        // Assertions
+        GGML_ASSERT(nb00 == ggml_type_size(gate_weights->type));
+        GGML_ASSERT(nb10 == ggml_type_size(input->type));
+        GGML_ASSERT(nb0 == sizeof(float));
+        GGML_ASSERT(input->type == GGML_TYPE_F32);
+        GGML_ASSERT(ne00 == ne10);  // dim_model must match
+
+        const int n_ids = ids->ne[0];  // n_expert_used
+        const int n_as  = ne02;        // n_expert
+
+        // Workspace for converted input
+        const size_t nbw1 = ggml_row_size(PARAM_TYPE, ne10);
+        const size_t nbw2 = nbw1 * ne11;
+        const size_t nbw3 = nbw2 * ne12;
+
+        struct mmid_row_mapping {
+            int32_t i1;
+            int32_t i2;
+        };
+
+        GGML_ASSERT(params->wsize >=
+                (GGML_PAD(nbw3, sizeof(int64_t)) +
+                 n_as * (ne12 + 1) * sizeof(mmid_row_mapping))
+                );
+
+        auto * wdata          = (char *)params->wdata;
+        auto * wdata_input_end = (char *)wdata + GGML_PAD(nbw3, sizeof(int64_t));
+
+        auto * matrix_row_counts = (int64_t *) (wdata_input_end);
+        struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (matrix_row_counts + n_as);
+
+        // Convert input: F32 => PARAM_TYPE
+        for (int64_t i12 = 0; i12 < ne12; ++i12) {
+            for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                from_float((float *)((char *) input->data + i12 * nb12 + i11 * nb11),
+                           (void *)(wdata + i12 * nbw2 + i11 * nbw1),
+                           ne10);
+            }
+        }
+
+        ggml_barrier(params->threadpool);
+
+        // Build matrix_row_counts and matrix_rows (thread 0 only)
+        if (ith == 0) {
+            memset(matrix_row_counts, 0, n_as * sizeof(int64_t));
+
+            for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                for (int id = 0; id < n_ids; ++id) {
+                    const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+                    GGML_ASSERT(i02 >= 0 && i02 < n_as);
+
+                    const int64_t row_count = matrix_row_counts[i02];
+                    matrix_rows[i02 * ne12 + row_count] = (struct mmid_row_mapping) {id, (int32_t)iid1};
+                    matrix_row_counts[i02] += 1;
+                }
+            }
+        }
+
+        ggml_barrier(params->threadpool);
+
+#define MMID_MATRIX_ROW(a, i) matrix_rows[(a) * ne12 + (i)]
+
+        // Process each expert
+        for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
+            const int64_t nr1 = matrix_row_counts[cur_a];
+
+            if (nr1 == 0) {
+                continue;
+            }
+
+            const char * gate_expert = (const char *) gate_weights->data + cur_a * nb02;
+            const char * up_expert   = (const char *) up_weights->data + cur_a * nb02;
+
+            // Compute gate and up projections, then fuse with SiLU
+            for (int ir1 = 0; ir1 < nr1; ir1++) {
+                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+
+                const int id = row_mapping.i1;      // selected expert index
+                const int64_t i12 = row_mapping.i2; // token index
+
+                const int64_t i1 = id;   // expert slot in output
+                const int64_t i2 = i12;  // token index
+
+                const auto * input_col = (const char *) wdata + (0 * nbw1 + i12 * nbw2);
+
+                float * dst_ptr = (float *)((char *) dst->data + (i1 * nb1 + i2 * nb2));
+
+                // Compute gate projection: [dim_ffn]
+                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00,
+                        dst_ptr, ne01,  // Write gate result to dst temporarily
+                        gate_expert,
+                        input_col, 1, ne01);
+
+                // Allocate temp buffer for up projection
+                float * up_tmp = (float *)alloca(ne01 * sizeof(float));
+
+                // Compute up projection: [dim_ffn]
+                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00,
+                        up_tmp, ne01,
+                        up_expert,
+                        input_col, 1, ne01);
+
+                // Apply SiLU fusion: dst = silu(gate) * up
+                for (int64_t i = 0; i < ne01; i++) {
+                    const float gate = dst_ptr[i];
+                    const float up = up_tmp[i];
+                    // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+                    const float silu_gate = gate / (1.0f + expf(-gate));
+                    dst_ptr[i] = silu_gate * up;
+                }
+            }
+        }
+
 #undef MMID_MATRIX_ROW
     }
 
