@@ -2290,44 +2290,152 @@ static void ggml_compute_forward_mul_mat_gate_up_silu(
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
-    // TODO: Implement the actual computation
-    // For now, this will be completed in the next step
-    // The implementation will:
-    // 1. Convert input if needed
-    // 2. Build matrix_row_counts and matrix_rows
-    // 3. Call AMX backend for gate projection
-    // 4. Call AMX backend for up projection
-    // 5. Apply SiLU + multiply fusion
+    // Step 1: Convert input to vec_dot_type if needed
+    if (input->type != vec_dot_type) {
+        const size_t nbw0 = ggml_type_size(vec_dot_type);
+        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+        const size_t nbw2 = nbw1 * ne11;
 
-    if (ith == 0) {
-        fprintf(stderr, "NOTE: GGML_OP_MUL_MAT_GATE_UP_SILU partial implementation (Phase 2.2 in progress)\n");
+        for (int64_t i12 = 0; i12 < ne12; ++i12) {
+            for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                size_t bs = ggml_blck_size(vec_dot_type);
+                int64_t ne10_block_start = (ith * ne10/bs) / nth;
+                int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+                from_float(
+                    (float *)((char *) input->data + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                    (void *)(wdata_input + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+                    (ne10_block_end - ne10_block_start) * bs
+                );
+            }
+        }
     }
 
-    GGML_UNUSED(from_float);
-    GGML_UNUSED(wdata_input);
-    GGML_UNUSED(gate_result);
-    GGML_UNUSED(up_result);
-    GGML_UNUSED(matrix_row_counts);
-    GGML_UNUSED(matrix_rows);
-    GGML_UNUSED(atomic_current_chunk);
-    GGML_UNUSED(amx_expert_stats);
-    GGML_UNUSED(nth);
-    GGML_UNUSED(ne0);
-    GGML_UNUSED(ne1);
-    GGML_UNUSED(ne2);
-    GGML_UNUSED(ne11);
-    GGML_UNUSED(ne12);
-    GGML_UNUSED(n_ids);
-    GGML_UNUSED(nb00);
-    GGML_UNUSED(nb01);
-    GGML_UNUSED(nb02);
-    GGML_UNUSED(nb10);
-    GGML_UNUSED(nb11);
-    GGML_UNUSED(nb12);
-    GGML_UNUSED(nb0);
-    GGML_UNUSED(nb1);
-    GGML_UNUSED(nb2);
-    GGML_UNUSED(up_weights);
+    // Step 2: Build matrix_row_counts and matrix_rows (thread 0 only)
+    if (ith == 0) {
+        memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+        memset(amx_expert_stats, 0, n_as*sizeof(struct amx_expert_stats));
+
+        // Group rows by expert
+        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+            for (int id = 0; id < n_ids; ++id) {
+                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                GGML_ASSERT(i02 >= 0 && i02 < n_as);
+                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
+                matrix_row_counts[i02] += 1;
+            }
+        }
+
+        // Initialize AMX expert stats
+        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+            const int64_t token_count = matrix_row_counts[cur_a];
+            if (token_count == 0) continue;
+
+            enum amx_precision_mode precision;
+            if (token_count >= AMX_INT8_THRESHOLD) {
+                precision = AMX_PRECISION_INT8;
+            } else if (token_count >= AMX_BF16_THRESHOLD) {
+                precision = AMX_PRECISION_BF16;
+            } else {
+                precision = AMX_PRECISION_VNNI;
+            }
+
+            amx_expert_stats[cur_a].total_tokens = token_count;
+            amx_expert_stats[cur_a].group_count = 1;
+            amx_expert_stats[cur_a].group.expert_id = cur_a;
+            amx_expert_stats[cur_a].group.token_count = token_count;
+            amx_expert_stats[cur_a].group.token_offset = 0;
+            amx_expert_stats[cur_a].group.precision = precision;
+        }
+    }
+
+    // Reset atomic chunk counters
+    for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
+        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+        *current_chunk_ctr = nth;
+    }
+
+    ggml_barrier(params->threadpool);
+
+    // Step 3: Compute gate projection
+    // For now, we'll use a simple fallback implementation
+    // A full AMX-optimized version would go here
+    for (int64_t i02 = ith; i02 < n_as; i02 += nth) {
+        const int64_t token_count = matrix_row_counts[i02];
+        if (token_count == 0) continue;
+
+        // Get pointers
+        const void * gate_expert = (const char *) gate_weights->data + i02 * nb02;
+
+        // Process each token for this expert
+        for (int64_t t = 0; t < token_count; ++t) {
+            struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(i02, t);
+            const int id = row_mapping.i1;
+            const int64_t iid1 = row_mapping.i2;
+
+            // Output position
+            float * gate_out = gate_result + iid1 * ne0 + id * ne01;
+
+            // Input position
+            const void * inp = (input->type == vec_dot_type) ?
+                ((const char *) input->data + iid1 * nb12) :
+                (wdata_input + iid1 * ggml_row_size(vec_dot_type, ne10));
+
+            // Simple fallback: use existing vec_dot function
+            // TODO: Replace with AMX-optimized path
+            ggml_vec_dot_t vec_dot = type_traits_cpu[gate_weights->type].vec_dot;
+            for (int64_t ir = 0; ir < ne01; ++ir) {
+                vec_dot(ne00, gate_out + ir, 0,
+                        (const char *)gate_expert + ir*nb01, 0,
+                        inp, 0, 1);
+            }
+        }
+    }
+
+    ggml_barrier(params->threadpool);
+
+    // Step 4: Compute up projection
+    for (int64_t i02 = ith; i02 < n_as; i02 += nth) {
+        const int64_t token_count = matrix_row_counts[i02];
+        if (token_count == 0) continue;
+
+        const void * up_expert = (const char *) up_weights->data + i02 * nb02;
+
+        for (int64_t t = 0; t < token_count; ++t) {
+            struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(i02, t);
+            const int id = row_mapping.i1;
+            const int64_t iid1 = row_mapping.i2;
+
+            float * up_out = up_result + iid1 * ne0 + id * ne01;
+
+            const void * inp = (input->type == vec_dot_type) ?
+                ((const char *) input->data + iid1 * nb12) :
+                (wdata_input + iid1 * ggml_row_size(vec_dot_type, ne10));
+
+            ggml_vec_dot_t vec_dot = type_traits_cpu[up_weights->type].vec_dot;
+            for (int64_t ir = 0; ir < ne01; ++ir) {
+                vec_dot(ne00, up_out + ir, 0,
+                        (const char *)up_expert + ir*nb01, 0,
+                        inp, 0, 1);
+            }
+        }
+    }
+
+    ggml_barrier(params->threadpool);
+
+    // Step 5: Apply SiLU + multiply fusion: dst = silu(gate) * up
+    const int64_t total_elements = ggml_nelements(dst);
+    const int64_t elements_per_thread = (total_elements + nth - 1) / nth;
+    const int64_t start = ith * elements_per_thread;
+    const int64_t end = (start + elements_per_thread < total_elements) ? (start + elements_per_thread) : total_elements;
+
+    float * dst_data = (float *) dst->data;
+    for (int64_t i = start; i < end; ++i) {
+        const float g = gate_result[i];
+        const float u = up_result[i];
+        // SiLU: silu(x) = x / (1 + exp(-x)) = x * sigmoid(x)
+        const float silu_g = g / (1.0f + expf(-g));
+        dst_data[i] = silu_g * u;
+    }
 }
 
 /////////////////////////////////
