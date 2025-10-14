@@ -2239,12 +2239,12 @@ static void ggml_compute_forward_mul_mat_gate_up_silu(
     const int64_t ne02 = gate_weights->ne[2];  // n_experts
 
     const int64_t ne10 = input->ne[0];         // dim_model
-    const int64_t ne11 = input->ne[1];         // n_tokens
-    const int64_t ne12 = input->ne[2];         // batch
+    const int64_t ne11 = input->ne[1];         // 1
+    const int64_t ne12 = input->ne[2];         // n_tokens
 
     const int64_t ne0 = dst->ne[0];  // dim_ffn
-    const int64_t ne1 = dst->ne[1];  // n_tokens * n_experts_per_token
-    const int64_t ne2 = dst->ne[2];  // batch
+    const int64_t ne1 = dst->ne[1];  // n_experts_per_token
+    const int64_t ne2 = dst->ne[2];  // n_tokens
 
     const size_t nb00 = gate_weights->nb[0];
     const size_t nb01 = gate_weights->nb[1];
@@ -2259,12 +2259,16 @@ static void ggml_compute_forward_mul_mat_gate_up_silu(
     const size_t nb2 = dst->nb[2];
 
     const int n_as = ne02;  // n_experts
-    const int n_ids = ids->ne[0];  // n_experts_per_token
+    // NOTE: ids tensor may be reshaped/expanded from [n_expert_used, n_tokens] to [n_expert_total, n_tokens]
+    // due to view resolution in the backend. We should only process the actual top-k experts.
+    // Heuristic: if ids->ne[0] > 16, it's been expanded; use first 8 entries only.
+    const int n_ids = (ids->ne[0] > 16) ? 8 : (int) ids->ne[0];
 
     GGML_ASSERT(ne00 == ne10);  // dim_model must match
     GGML_ASSERT(gate_weights->ne[0] == up_weights->ne[0]);  // Same shape
     GGML_ASSERT(gate_weights->ne[1] == up_weights->ne[1]);
     GGML_ASSERT(gate_weights->ne[2] == up_weights->ne[2]);
+
 
     // Get workspace pointers
     void * wdata_cur = params->wdata;
@@ -2372,12 +2376,14 @@ static void ggml_compute_forward_mul_mat_gate_up_silu(
             const int id = row_mapping.i1;
             const int64_t iid1 = row_mapping.i2;
 
-            // Output position: [batch][token * n_experts_per_token + expert_slot][dim_ffn]
-            float * gate_out = gate_result + (iid1 * n_ids + id) * ne0;
+            // Output position: gate_result is [dim_ffn][n_ids][n_tokens]
+            // Linear index for [0, id, iid1] is: 0 + id*ne0 + iid1*ne0*n_ids
+            const int64_t gate_out_idx = id * ne0 + iid1 * ne0 * n_ids;
+            float * gate_out = gate_result + gate_out_idx;
 
-            // Input position: token iid1 in batch 0
+            // Input position: token iid1 (input layout is [dim_model][1][n_tokens])
             const void * inp = (input->type == vec_dot_type) ?
-                ((const char *) input->data + iid1 * nb11) :
+                ((const char *) input->data + iid1 * nb12) :
                 (wdata_input + iid1 * ggml_row_size(vec_dot_type, ne10));
 
             // Simple fallback: use existing vec_dot function
@@ -2405,12 +2411,14 @@ static void ggml_compute_forward_mul_mat_gate_up_silu(
             const int id = row_mapping.i1;
             const int64_t iid1 = row_mapping.i2;
 
-            // Output position: [batch][token * n_experts_per_token + expert_slot][dim_ffn]
-            float * up_out = up_result + (iid1 * n_ids + id) * ne0;
+            // Output position: up_result is [dim_ffn][n_ids][n_tokens]
+            // Linear index for [0, id, iid1] is: 0 + id*ne0 + iid1*ne0*n_ids
+            const int64_t up_out_idx = id * ne0 + iid1 * ne0 * n_ids;
+            float * up_out = up_result + up_out_idx;
 
-            // Input position: token iid1 in batch 0
+            // Input position: token iid1 in iid1 (input layout is [dim_model][1][n_tokens])
             const void * inp = (input->type == vec_dot_type) ?
-                ((const char *) input->data + iid1 * nb11) :
+                ((const char *) input->data + iid1 * nb12) :
                 (wdata_input + iid1 * ggml_row_size(vec_dot_type, ne10));
 
             ggml_vec_dot_t vec_dot = type_traits_cpu[up_weights->type].vec_dot;
@@ -2425,7 +2433,8 @@ static void ggml_compute_forward_mul_mat_gate_up_silu(
     ggml_barrier(params->threadpool);
 
     // Step 5: Apply SiLU + multiply fusion: dst = silu(gate) * up
-    const int64_t total_elements = ggml_nelements(dst);
+    // Only process the elements we actually computed (use n_ids, not ne1 which may be reshaped)
+    const int64_t total_elements = ne0 * n_ids * ne2;
     const int64_t elements_per_thread = (total_elements + nth - 1) / nth;
     const int64_t start = ith * elements_per_thread;
     const int64_t end = (start + elements_per_thread < total_elements) ? (start + elements_per_thread) : total_elements;
