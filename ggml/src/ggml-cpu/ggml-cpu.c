@@ -2202,6 +2202,67 @@ static void ggml_compute_forward_mul_mat_id(
     }
 }
 
+// ggml_compute_forward_mul_mat_gate_up_silu
+//
+// Fused gate+up projection with SiLU activation for MoE
+// result = silu(gate_weights @ input) * (up_weights @ input)
+//
+// This operation combines two MUL_MAT_ID operations (gate and up projections)
+// with a SiLU activation and elementwise multiply, reducing kernel overhead
+// and improving cache utilization.
+//
+static void ggml_compute_forward_mul_mat_gate_up_silu(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * gate_weights = dst->src[0];
+    const struct ggml_tensor * up_weights   = dst->src[1];
+    const struct ggml_tensor * input        = dst->src[2];
+    const struct ggml_tensor * ids          = dst->src[3];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // For Phase 2.1, we'll implement a basic version using temporary buffers
+    // Phase 2.2 will optimize this with full AMX fusion
+
+    // Get workspace pointers
+    void * wdata_cur = params->wdata;
+
+    // Input conversion buffer (if needed)
+    const enum ggml_type vec_dot_type = type_traits_cpu[gate_weights->type].vec_dot_type;
+    if (input->type != vec_dot_type) {
+        incr_ptr_aligned(&wdata_cur, ggml_row_size(vec_dot_type, ggml_nelements(input)), sizeof(int64_t));
+    }
+
+    // Temporary buffers for gate and up results
+    float * gate_result = (float *) incr_ptr_aligned(&wdata_cur, ggml_nbytes(dst), sizeof(int64_t));
+    float * up_result   = (float *) incr_ptr_aligned(&wdata_cur, ggml_nbytes(dst), sizeof(int64_t));
+
+    // TODO (Phase 2.2): Implement full fused computation
+    // For now, this is a placeholder that will be implemented in the AMX backend
+    //
+    // The full implementation will:
+    // 1. Compute gate projection: gate_result = gate_weights @ input
+    // 2. Compute up projection: up_result = up_weights @ input
+    // 3. Apply fusion: dst = silu(gate_result) * up_result
+    //
+    // This will be done with proper AMX optimization, reusing the token sorting
+    // infrastructure from Phase 1, and minimizing memory transfers.
+
+    if (ith == 0) {
+        fprintf(stderr, "WARNING: GGML_OP_MUL_MAT_GATE_UP_SILU not fully implemented yet (Phase 2.2 pending)\n");
+    }
+
+    GGML_UNUSED(gate_weights);
+    GGML_UNUSED(up_weights);
+    GGML_UNUSED(input);
+    GGML_UNUSED(ids);
+    GGML_UNUSED(gate_result);
+    GGML_UNUSED(up_result);
+    GGML_UNUSED(nth);
+}
+
 /////////////////////////////////
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
@@ -2332,6 +2393,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
+            } break;
+        case GGML_OP_MUL_MAT_GATE_UP_SILU:
+            {
+                ggml_compute_forward_mul_mat_gate_up_silu(params, tensor);
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -2775,6 +2840,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_GATE_UP_SILU:
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;
@@ -3306,6 +3372,35 @@ struct ggml_cplan ggml_graph_plan(
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
                         // amx_expert_stats (Phase 1: token grouping)
+                        cur += n_as*sizeof(struct amx_expert_stats) + sizeof(int64_t);
+                    } break;
+                case GGML_OP_MUL_MAT_GATE_UP_SILU:
+                    {
+                        cur = 0;
+                        const struct ggml_tensor * gate_weights = node->src[0];
+                        // const struct ggml_tensor * up_weights = node->src[1];  // Same as gate_weights
+                        const struct ggml_tensor * input = node->src[2];
+                        const struct ggml_tensor * ids = node->src[3];
+                        const enum ggml_type vec_dot_type = type_traits_cpu[gate_weights->type].vec_dot_type;
+                        const int n_as = gate_weights->ne[2];
+
+                        // input conversion if needed
+                        if (input->type != vec_dot_type) {
+                            cur += ggml_row_size(vec_dot_type, ggml_nelements(input)) + sizeof(int64_t);
+                        }
+
+                        // Temporary buffers for gate and up projection results
+                        // Each has same size as node (output)
+                        cur += ggml_nbytes(node) + sizeof(int64_t);  // gate result
+                        cur += ggml_nbytes(node) + sizeof(int64_t);  // up result
+
+                        // matrix_row_counts
+                        cur += n_as * sizeof(int64_t) + sizeof(int64_t);
+                        // matrix_rows
+                        cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
+                        // atomic_current_chunk
+                        cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                        // amx_expert_stats
                         cur += n_as*sizeof(struct amx_expert_stats) + sizeof(int64_t);
                     } break;
                 case GGML_OP_OUT_PROD:

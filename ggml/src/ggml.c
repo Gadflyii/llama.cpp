@@ -950,6 +950,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT",
     "MUL_MAT_ID",
+    "MUL_MAT_GATE_UP_SILU",
     "OUT_PROD",
 
     "SCALE",
@@ -1019,7 +1020,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
+static_assert(GGML_OP_COUNT == 91, "GGML_OP_COUNT != 91");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1123,7 +1124,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
+static_assert(GGML_OP_COUNT == 91, "GGML_OP_COUNT != 91");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3102,6 +3103,48 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
+
+    return result;
+}
+
+// ggml_mul_mat_gate_up_silu
+
+struct ggml_tensor * ggml_mul_mat_gate_up_silu(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gate_weights,
+        struct ggml_tensor  * up_weights,
+        struct ggml_tensor  * input,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(!ggml_is_transposed(gate_weights));
+    GGML_ASSERT(!ggml_is_transposed(up_weights));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+
+    // gate_weights and up_weights are 3d (one matrix per expert)
+    GGML_ASSERT(gate_weights->ne[3] == 1);
+    GGML_ASSERT(up_weights->ne[3] == 1);
+    GGML_ASSERT(input->ne[3] == 1); // input is 3d
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1); // ids is 2d
+    GGML_ASSERT(ids->ne[1] == input->ne[2]); // must have an expert list per input row
+
+    // gate_weights and up_weights must have same shape
+    GGML_ASSERT(gate_weights->ne[0] == up_weights->ne[0]);
+    GGML_ASSERT(gate_weights->ne[1] == up_weights->ne[1]);
+    GGML_ASSERT(gate_weights->ne[2] == up_weights->ne[2]);
+
+    // can_mul_mat check
+    GGML_ASSERT(gate_weights->ne[0] == input->ne[0]);
+    GGML_ASSERT(up_weights->ne[0] == input->ne[0]);
+    GGML_ASSERT(ids->ne[0] % input->ne[1] == 0); // can broadcast
+
+    // Output has same shape as a single mul_mat_id result
+    const int64_t ne[4] = { gate_weights->ne[1], ids->ne[0], input->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MUL_MAT_GATE_UP_SILU;
+    result->src[0] = gate_weights;
+    result->src[1] = up_weights;
+    result->src[2] = input;
+    result->src[3] = ids;
 
     return result;
 }

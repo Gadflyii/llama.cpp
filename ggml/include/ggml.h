@@ -489,6 +489,7 @@ extern "C" {
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
+        GGML_OP_MUL_MAT_GATE_UP_SILU,  // Fused gate+up projection with SiLU for MoE
         GGML_OP_OUT_PROD,
 
         GGML_OP_SCALE,
@@ -1327,6 +1328,19 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
+            struct ggml_tensor  * ids);
+
+    // Fused gate+up projection with SiLU activation for MoE
+    // result = silu(gate_weights @ input) * (up_weights @ input)
+    // gate_weights: [n_experts, dim_ffn, dim_model] - gate projection expert weights
+    // up_weights:   [n_experts, dim_ffn, dim_model] - up projection expert weights
+    // input:        [batch, dim_model] - input activations
+    // ids:          [batch, n_tokens_per_expert] - expert IDs per token
+    GGML_API struct ggml_tensor * ggml_mul_mat_gate_up_silu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate_weights,
+            struct ggml_tensor  * up_weights,
+            struct ggml_tensor  * input,
             struct ggml_tensor  * ids);
 
     // A: m columns, n rows,
