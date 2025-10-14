@@ -982,11 +982,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     // Phase 2: Fused gate+up+silu optimization
-    // When both gate and up projections exist without biases, we can use the fused operation
-    // for better performance (+10-15% expected speedup)
+    // When both gate and up projections exist without biases AND --amx-arch fused_moe is set,
+    // we can use the fused operation for better performance (+10-15% expected speedup)
     const bool can_use_fused = (gate_exps != nullptr) && (up_exps != nullptr) &&
                                  (gate_exps_b == nullptr) && (up_exps_b == nullptr) &&
-                                 (type_op == LLM_FFN_SILU);
+                                 (type_op == LLM_FFN_SILU) &&
+                                 (ggml_get_amx_moe_arch() == GGML_AMX_MOE_ARCH_FUSED_MOE);
 
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;

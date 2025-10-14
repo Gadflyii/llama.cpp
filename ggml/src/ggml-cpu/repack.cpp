@@ -1579,6 +1579,29 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
                     return true;
                 }
+            case GGML_OP_MUL_MAT_GATE_UP_SILU:
+                {
+                    const int64_t n_as = op->src[0]->ne[2];
+                    const int64_t n_ids = op->src[3]->ne[0];
+                    const int64_t ne12 = op->src[2]->ne[2];
+
+                    size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[2]));
+                    size = GGML_PAD(size, sizeof(int64_t));
+
+                    size += GGML_PAD(ggml_nbytes(op), sizeof(int64_t));
+                    size += GGML_PAD(ggml_nbytes(op), sizeof(int64_t));
+
+                    size += GGML_PAD(n_as * sizeof(int64_t), sizeof(int64_t));
+                    size += GGML_PAD(n_as * n_ids * ne12 * 2 * sizeof(int64_t), sizeof(int64_t));
+
+                    #ifndef CACHE_LINE_SIZE
+                    #define CACHE_LINE_SIZE 64
+                    #endif
+                    size += GGML_PAD(CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
+                    size += GGML_PAD(n_as * 64, sizeof(int64_t));
+
+                    return true;
+                }
             default:
                 // GGML_ABORT("fatal error");
                 break;
@@ -1594,6 +1617,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             case GGML_OP_MUL_MAT_ID:
                 forward_mul_mat_id(params, op);
                 return true;
+            case GGML_OP_MUL_MAT_GATE_UP_SILU:
+                return false;
             default:
                 // GGML_ABORT("fatal error");
                 break;
@@ -2040,12 +2065,32 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             //if (op->src[1]->type == GGML_TYPE_Q8_0) {
             //    return true;
             //}
+        } else if (op->op == GGML_OP_MUL_MAT_GATE_UP_SILU
+                && op->src[0]->buffer
+                && op->src[1]->buffer
+                && (ggml_n_dims(op->src[0]) == 3)
+                && (ggml_n_dims(op->src[1]) == 3)
+                && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
+                && op->src[1]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
+                && ggml_repack_get_optimal_repack_type(op->src[0])
+                && ggml_repack_get_optimal_repack_type(op->src[1])
+                ) {
+            if (op->src[2]->buffer && !ggml_backend_buft_is_host(op->src[2]->buffer->buft)) {
+                return false;
+            }
+            if (op->src[2]->type == GGML_TYPE_F32) {
+                return true;
+            }
         }
         return false;
     }
 
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
         if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) {
+            if (op->src[0]->buffer && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
+                return (ggml::cpu::tensor_traits *) op->src[0]->extra;
+            }
+        } else if (op->op == GGML_OP_MUL_MAT_GATE_UP_SILU) {
             if (op->src[0]->buffer && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
                 return (ggml::cpu::tensor_traits *) op->src[0]->extra;
             }

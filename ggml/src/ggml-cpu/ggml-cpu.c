@@ -2372,12 +2372,12 @@ static void ggml_compute_forward_mul_mat_gate_up_silu(
             const int id = row_mapping.i1;
             const int64_t iid1 = row_mapping.i2;
 
-            // Output position
-            float * gate_out = gate_result + iid1 * ne0 + id * ne01;
+            // Output position: [batch][token * n_experts_per_token + expert_slot][dim_ffn]
+            float * gate_out = gate_result + (iid1 * n_ids + id) * ne0;
 
-            // Input position
+            // Input position: token iid1 in batch 0
             const void * inp = (input->type == vec_dot_type) ?
-                ((const char *) input->data + iid1 * nb12) :
+                ((const char *) input->data + iid1 * nb11) :
                 (wdata_input + iid1 * ggml_row_size(vec_dot_type, ne10));
 
             // Simple fallback: use existing vec_dot function
@@ -2405,10 +2405,12 @@ static void ggml_compute_forward_mul_mat_gate_up_silu(
             const int id = row_mapping.i1;
             const int64_t iid1 = row_mapping.i2;
 
-            float * up_out = up_result + iid1 * ne0 + id * ne01;
+            // Output position: [batch][token * n_experts_per_token + expert_slot][dim_ffn]
+            float * up_out = up_result + (iid1 * n_ids + id) * ne0;
 
+            // Input position: token iid1 in batch 0
             const void * inp = (input->type == vec_dot_type) ?
-                ((const char *) input->data + iid1 * nb12) :
+                ((const char *) input->data + iid1 * nb11) :
                 (wdata_input + iid1 * ggml_row_size(vec_dot_type, ne10));
 
             ggml_vec_dot_t vec_dot = type_traits_cpu[up_weights->type].vec_dot;
