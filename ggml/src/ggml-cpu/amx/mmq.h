@@ -51,6 +51,13 @@ void ggml_backend_amx_mul_mat_moe_batch(
 // Called after weights are repacked to replicate across NUMA groups
 void ggml_backend_amx_numa_replicate_expert(int64_t expert_id, const void * data, size_t size);
 
+// Check if NUMA weight replication is enabled
+bool ggml_backend_amx_numa_is_enabled();
+
+// Get NUMA-aware expert weight pointer for current thread
+// Returns socket-local pointer if NUMA is enabled, otherwise returns fallback_ptr
+const void * ggml_backend_amx_numa_get_expert_weight(int64_t expert_id, const void * fallback_ptr);
+
 #ifdef __cplusplus
 }
 #endif

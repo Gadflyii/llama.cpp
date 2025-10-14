@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <type_traits>
 #include <cstdlib>  // for std::getenv, std::atoi
+#include <cstring>  // for memset
 
 #if defined(__gnu_linux__)
 #include <sys/syscall.h>
@@ -354,18 +355,30 @@ static const void* get_numa_expert_weight(int64_t expert_id, const void* fallbac
         return fallback_ptr;
     }
 
-    // Determine which NUMA node this thread is running on
-    int numa_id = numa_node_of_cpu(sched_getcpu());
+    // Cache NUMA node per thread to avoid repeated sched_getcpu() syscalls
+    static thread_local int cached_numa_id = -1;
+    static thread_local int cached_group_id = -1;
 
-    // Look up the corresponding group
-    auto it = g_numa_moe_weights.numa_to_group.find(numa_id);
-    if (it == g_numa_moe_weights.numa_to_group.end()) {
-        // Fallback if NUMA node not found
+    if (cached_numa_id == -1) {
+        // First call from this thread - determine and cache NUMA node
+        cached_numa_id = numa_node_of_cpu(sched_getcpu());
+
+        // Look up and cache the corresponding group
+        auto it = g_numa_moe_weights.numa_to_group.find(cached_numa_id);
+        if (it == g_numa_moe_weights.numa_to_group.end()) {
+            // NUMA node not in any group - disable for this thread
+            cached_group_id = -2;  // Special value meaning "not found"
+        } else {
+            cached_group_id = it->second;
+        }
+    }
+
+    // Check if this thread's NUMA node is in a replication group
+    if (cached_group_id < 0) {
         return fallback_ptr;
     }
 
-    int group_id = it->second;
-    auto& group = g_numa_moe_weights.groups[group_id];
+    auto& group = g_numa_moe_weights.groups[cached_group_id];
 
     // Look up the expert weight in this group
     auto expert_it = group.expert_data.find(expert_id);
@@ -394,6 +407,49 @@ static void free_numa_moe_weights() {
     g_numa_moe_weights.enabled = false;
 }
 
+// NUMA-aware buffer allocation using interleaved memory policy
+// This ensures buffer pages are distributed across NUMA nodes
+template<typename T>
+static void numa_aware_vector_resize(std::vector<T>& vec, size_t size, const ggml_compute_params* params) {
+#if defined(__gnu_linux__)
+    if (!g_numa_moe_weights.enabled || !params) {
+        // No NUMA replication enabled or no threadpool - use default allocation
+        vec.resize(size);
+        return;
+    }
+
+    // Allocate buffer
+    vec.resize(size);
+
+    // Use mbind() to interleave pages across all NUMA nodes in the groups
+    const size_t byte_size = size * sizeof(T);
+    if (byte_size > 0 && !g_numa_moe_weights.groups.empty()) {
+        // Build nodemask from all NUMA groups
+        struct bitmask *nodemask = numa_allocate_nodemask();
+        for (const auto& group : g_numa_moe_weights.groups) {
+            for (int node : group.numa_nodes) {
+                numa_bitmask_setbit(nodemask, node);
+            }
+        }
+
+        // Apply interleaved policy to the allocated memory
+        // MPOL_INTERLEAVE distributes pages round-robin across nodes in the mask
+        void* addr = vec.data();
+        long result = mbind(addr, byte_size, MPOL_INTERLEAVE, nodemask->maskp, nodemask->size + 1, 0);
+
+        numa_free_nodemask(nodemask);
+
+        if (result != 0) {
+            // mbind failed - not critical, just log and continue
+            // fprintf(stderr, "Warning: mbind failed for activation buffer\n");
+        }
+    }
+#else
+    (void)params;
+    vec.resize(size);
+#endif
+}
+
 #else  // !__gnu_linux__
 
 // Stub implementations for non-Linux platforms
@@ -411,6 +467,16 @@ static void free_numa_moe_weights() {}
 // Public API for CPU_REPACK backend to replicate expert weights
 void ggml_backend_amx_numa_replicate_expert(int64_t expert_id, const void * data, size_t size) {
     replicate_expert_weight(expert_id, data, size);
+}
+
+// Public API to check if NUMA weight replication is enabled
+bool ggml_backend_amx_numa_is_enabled() {
+    return g_numa_moe_weights.enabled;
+}
+
+// Public API to get NUMA-aware expert weight pointer
+const void * ggml_backend_amx_numa_get_expert_weight(int64_t expert_id, const void * fallback_ptr) {
+    return get_numa_expert_weight(expert_id, fallback_ptr);
 }
 
 // =============================================================================
@@ -3035,12 +3101,14 @@ void ggml_backend_amx_mul_mat_moe_expert(
         if (buffer_pool.quantized_capacity < required_quantized) {
             // Grow with 1.5x factor to reduce reallocations
             const size_t new_capacity = std::max(required_quantized, buffer_pool.quantized_capacity * 3 / 2);
-            buffer_pool.quantized_input.resize(new_capacity);
+            // Use NUMA-aware allocation with first-touch to distribute pages across sockets
+            numa_aware_vector_resize(buffer_pool.quantized_input, new_capacity, params);
             buffer_pool.quantized_capacity = new_capacity;
         }
         if (buffer_pool.output_capacity < required_output) {
             const size_t new_capacity = std::max(required_output, buffer_pool.output_capacity * 3 / 2);
-            buffer_pool.output.resize(new_capacity);
+            // Use NUMA-aware allocation with first-touch to distribute pages across sockets
+            numa_aware_vector_resize(buffer_pool.output, new_capacity, params);
             buffer_pool.output_capacity = new_capacity;
         }
 
@@ -3212,8 +3280,9 @@ void ggml_backend_amx_mul_mat_moe_batch(
 
             expert_bufs[idx].M = M;
             expert_bufs[idx].expert_id = expert_id;
-            expert_bufs[idx].quantized_input.resize(M * row_size_A);
-            expert_bufs[idx].output.resize(M * N);
+            // Use NUMA-aware allocation with first-touch to distribute pages across sockets
+            numa_aware_vector_resize(expert_bufs[idx].quantized_input, M * row_size_A, params);
+            numa_aware_vector_resize(expert_bufs[idx].output, M * N, params);
         }
 
         // Phase 1: Parallel quantization across all experts

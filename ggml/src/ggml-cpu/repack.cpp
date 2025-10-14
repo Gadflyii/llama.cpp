@@ -1765,7 +1765,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 continue;
             }
 
-            const auto * src0_cur = (const char *) src0->data + cur_a*nb02;
+            // NUMA-aware expert weight lookup (socket-local if enabled)
+            const auto * src0_base = (const char *) src0->data + cur_a*nb02;
+            const auto * src0_cur = (const char *) ggml_backend_amx_numa_get_expert_weight(cur_a, src0_base);
 
             //const int64_t nr0 = ne01; // src0 rows
             const int64_t nr1 = cne1; // src1 rows
@@ -1934,9 +1936,9 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     GGML_ASSERT(OK == 0);
     GGML_UNUSED(buffer);
 
-    // NUMA weight replication for MoE experts
-    // Check if this is a MoE expert tensor (3D tensor with ne[2] > 1)
-    if (tensor->ne[2] > 1) {
+    // NUMA weight replication for MoE experts (only if enabled)
+    // Check if NUMA replication is enabled and this is a MoE expert tensor (3D tensor with ne[2] > 1)
+    if (ggml_backend_amx_numa_is_enabled() && tensor->ne[2] > 1) {
         const int64_t num_experts = tensor->ne[2];
         const size_t expert_stride = tensor->nb[2];
 
