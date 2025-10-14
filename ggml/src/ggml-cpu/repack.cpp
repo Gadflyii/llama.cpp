@@ -18,6 +18,7 @@
 
 #include "repack.h"
 #include "amx/mmq.h"
+#include "amx/silu_fusion.h"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
@@ -1963,14 +1964,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         up_expert,
                         input_col, 1, ne01);
 
-                // Apply SiLU fusion: dst = silu(gate) * up
-                for (int64_t i = 0; i < ne01; i++) {
-                    const float gate = dst_ptr[i];
-                    const float up = up_tmp[i];
-                    // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
-                    const float silu_gate = gate / (1.0f + expf(-gate));
-                    dst_ptr[i] = silu_gate * up;
-                }
+                // Apply fused SiLU(gate) * up using optimized AVX-512 implementation
+                // This handles both AVX-512 (vectorized) and fallback (scalar) paths
+                fused_silu_mul_avx512(dst_ptr, up_tmp, dst_ptr, ne01);
             }
         }
 
