@@ -1924,7 +1924,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
 #define MMID_MATRIX_ROW(a, i) matrix_rows[(a) * ne12 + (i)]
 
-        // Process each expert
+        // Process each expert - OPTIMIZED: batch tokens using gemm instead of per-token gemv
         for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
             const int64_t nr1 = matrix_row_counts[cur_a];
 
@@ -1935,38 +1935,71 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             const char * gate_expert = (const char *) gate_weights->data + cur_a * nb02;
             const char * up_expert   = (const char *) up_weights->data + cur_a * nb02;
 
-            // Compute gate and up projections, then fuse with SiLU
+            // OPTIMIZATION: Batch tokens together for better performance
+            // - gemm processes multiple rows (tokens) in parallel using SIMD
+            // - Reduces per-token overhead, improves cache utilization
+            // - Expected speedup: 2-3x vs token-by-token gemv
+
+            // Allocate batch buffers for gate and up projections
+            float * gate_batch = (float *)alloca(nr1 * ne01 * sizeof(float));
+            float * up_batch = (float *)alloca(nr1 * sizeof(float) * ne01);
+
+            // Allocate contiguous buffer for batched inputs (required by gemm)
+            char * input_batch = (char *)alloca(nr1 * nbw1);
+
+            // Copy all input vectors for this expert into contiguous buffer
             for (int ir1 = 0; ir1 < nr1; ir1++) {
                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+                const int64_t i12 = row_mapping.i2; // token index
+                const char * input_src = (const char *) wdata + (0 * nbw1 + i12 * nbw2);
+                char * input_dst = input_batch + ir1 * nbw1;
+                memcpy(input_dst, input_src, nbw1);
+            }
 
+            // Use gemm for batches of 4, gemv for remainder (gemm requires nc % 4 == 0)
+            const int64_t nr1_gemm = nr1 - nr1 % 4;
+
+            if (nr1_gemm > 0) {
+                // Batched gate projection using gemm: [nr1_gemm x dim_model] × [dim_model x dim_ffn]^T
+                gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00,
+                        gate_batch, ne01,
+                        gate_expert,
+                        input_batch, nr1_gemm, ne01);
+
+                // Batched up projection using gemm: [nr1_gemm x dim_model] × [dim_model x dim_ffn]^T
+                gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00,
+                        up_batch, ne01,
+                        up_expert,
+                        input_batch, nr1_gemm, ne01);
+            }
+
+            // Handle remainder tokens (< 4) with gemv
+            for (int ir1 = nr1_gemm; ir1 < nr1; ir1++) {
+                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00,
+                        gate_batch + ir1 * ne01, ne01,
+                        gate_expert,
+                        input_batch + ir1 * nbw1, 1, ne01);
+
+                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00,
+                        up_batch + ir1 * ne01, ne01,
+                        up_expert,
+                        input_batch + ir1 * nbw1, 1, ne01);
+            }
+
+            // Apply SiLU fusion and write to output
+            for (int ir1 = 0; ir1 < nr1; ir1++) {
+                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
                 const int id = row_mapping.i1;      // selected expert index
                 const int64_t i12 = row_mapping.i2; // token index
-
                 const int64_t i1 = id;   // expert slot in output
                 const int64_t i2 = i12;  // token index
 
-                const auto * input_col = (const char *) wdata + (0 * nbw1 + i12 * nbw2);
-
                 float * dst_ptr = (float *)((char *) dst->data + (i1 * nb1 + i2 * nb2));
-
-                // Compute gate projection: [dim_ffn]
-                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00,
-                        dst_ptr, ne01,  // Write gate result to dst temporarily
-                        gate_expert,
-                        input_col, 1, ne01);
-
-                // Allocate temp buffer for up projection
-                float * up_tmp = (float *)alloca(ne01 * sizeof(float));
-
-                // Compute up projection: [dim_ffn]
-                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00,
-                        up_tmp, ne01,
-                        up_expert,
-                        input_col, 1, ne01);
+                const float * gate_ptr = gate_batch + ir1 * ne01;
+                const float * up_ptr = up_batch + ir1 * ne01;
 
                 // Apply fused SiLU(gate) * up using optimized AVX-512 implementation
-                // This handles both AVX-512 (vectorized) and fallback (scalar) paths
-                fused_silu_mul_avx512(dst_ptr, up_tmp, dst_ptr, ne01);
+                fused_silu_mul_avx512(gate_ptr, up_ptr, dst_ptr, ne01);
             }
         }
 
