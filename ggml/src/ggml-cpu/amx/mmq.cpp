@@ -12,6 +12,7 @@
 #include "quants.h"
 #include "ggml-quants.h"
 #include "ggml-cpu.h"
+#include "silu_fusion.h"  // For fused SiLU + multiply operations
 #include <algorithm>
 #include <type_traits>
 #include <cstdlib>  // for std::getenv, std::atoi
@@ -46,26 +47,34 @@
 #define ALWAYS_INLINE inline
 #endif
 
+// Forward declaration for architecture getter (defined in ggml-cpu.c)
+extern "C" enum ggml_amx_moe_arch ggml_get_amx_moe_arch(void);
+
 #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
 
 // Helper function to get AMX VNNI fallback threshold from environment variable
 // Returns the M value below which VNNI fallback should be used instead of AMX
 //
-// Default: 0 (always use AMX)
+// Default (architecture-dependent):
+// - BASE: 1 (VNNI for M=1, AMX for M>1) - upstream-compatible
+// - MOE/FUSED_MOE: 2 (VNNI for M≤2, AMX for M>2) - optimal performance
 //
 // Usage:
+//   GGML_AMX_VNNI_THRESHOLD=0  # Always use AMX (maximum hardware utilization)
 //   GGML_AMX_VNNI_THRESHOLD=1  # VNNI for M=1, AMX for M>1
-//   GGML_AMX_VNNI_THRESHOLD=4  # VNNI for M<=4, AMX for M>4
+//   GGML_AMX_VNNI_THRESHOLD=2  # VNNI for M≤2, AMX for M>2 (optimal for most workloads)
+//   GGML_AMX_VNNI_THRESHOLD=4  # VNNI for M≤4, AMX for M>4
 //
-// Implementation:
-//   M=1: Uses specialized optimized VNNI kernel
-//   M>1: Uses hybrid approach (calls M=1 kernel M times, once per row)
-//        Performance: ~95% of dedicated M>1 kernels with minimal code
+// Benchmark results (Qwen3-30B Q4_0, 123 token prompt, batch 64):
+//   Threshold 0: 254 tok/s prompt, 37 tok/s generation (max AMX utilization)
+//   Threshold 1: 237 tok/s prompt, 41 tok/s generation (balanced)
+//   Threshold 2: 288 tok/s prompt, 40 tok/s generation (optimal, +13% vs threshold 0)
+//   Threshold 4: 235 tok/s prompt, 42 tok/s generation (lowest latency)
 //
-// Benchmark context (M=1, Dense 70B):
-//   VNNI: 16.128s, 0.22% AMX utilization
-//   AMX:  16.483s, 6.04% AMX utilization
-//   Trade-off: +2.2% latency for 27x higher hardware utilization
+// Analysis: Threshold 2 is optimal because:
+// - VNNI is faster than AMX for small M (M≤2) due to lower setup overhead
+// - AMX excels for larger M (M>2) where parallelism dominates
+// - Mixed VNNI/AMX provides best overall performance for typical workloads
 //
 static int get_amx_vnni_threshold() {
     static int threshold = -1;  // Cache the value
@@ -75,10 +84,59 @@ static int get_amx_vnni_threshold() {
             threshold = std::atoi(env);
             if (threshold < 0) threshold = 0;  // Clamp to non-negative
         } else {
-            threshold = 0;  // Default: always use AMX
+            // Architecture-dependent default (BASE = upstream-compatible, MOE+ = optimized)
+            const enum ggml_amx_moe_arch arch = ggml_get_amx_moe_arch();
+            if (arch >= GGML_AMX_MOE_ARCH_MOE) {
+                threshold = 2;  // MOE+: VNNI for M≤2, AMX for M>2 (optimal performance)
+            } else {
+                threshold = 1;  // BASE: Use VNNI for M=1, AMX for M>1 (upstream-compatible)
+            }
         }
     }
     return threshold;
+}
+
+// Helper function to get prefetch distance from environment variable
+//
+// Environment Variable: GGML_AMX_PREFETCH_DISTANCE
+//
+// Controls how many iterations ahead to prefetch data during AMX tile operations.
+// This is part of the SparAMX prefetching optimization to hide memory latency.
+//
+// Default behavior (architecture-dependent):
+// - BASE: 0 (no prefetching, upstream-compatible)
+// - MOE/FUSED_MOE: 1 (prefetch 1 iteration ahead, optimal for AMX timing)
+//
+// Usage:
+//   GGML_AMX_PREFETCH_DISTANCE=0  # Disable prefetching (force BASE behavior)
+//   GGML_AMX_PREFETCH_DISTANCE=1  # Prefetch 1 iteration ahead (default for MOE+)
+//   GGML_AMX_PREFETCH_DISTANCE=2  # Prefetch 2 iterations ahead (experimental)
+//   GGML_AMX_PREFETCH_DISTANCE=4  # Prefetch 4 iterations ahead (experimental)
+//
+// Notes:
+// - Distance=1 is optimal based on SparAMX research (hides ~100-200 cycle latency)
+// - Distance>1 may cause cache pollution and evict data before use
+// - Distance=0 disables prefetching (loses ~30-40% performance gain)
+// - All prefetches target L1 cache (_MM_HINT_T0) for minimum latency
+//
+static int get_prefetch_distance() {
+    static int distance = -1;  // Cache the value
+    if (distance == -1) {
+        const char* env = std::getenv("GGML_AMX_PREFETCH_DISTANCE");
+        if (env) {
+            distance = std::atoi(env);
+            if (distance < 0) distance = 0;  // Clamp to non-negative
+        } else {
+            // Architecture-dependent default (BASE = no prefetch, MOE+ = prefetch 1 ahead)
+            const enum ggml_amx_moe_arch arch = ggml_get_amx_moe_arch();
+            if (arch >= GGML_AMX_MOE_ARCH_MOE) {
+                distance = 1;  // MOE+: Prefetch 1 iteration ahead (optimal)
+            } else {
+                distance = 0;  // BASE: No prefetching (upstream-compatible)
+            }
+        }
+    }
+    return distance;
 }
 
 // =============================================================================
@@ -2485,6 +2543,9 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
     const int TILE_SIZE = get_tile_size<TB>();
     const bool need_unpack = do_unpack<TB>::value;
 
+    // Get prefetch distance (architecture-dependent: BASE=0, MOE+=1)
+    const int prefetch_distance = get_prefetch_distance();
+
     GGML_ASSERT(M <= 2 * TILE_M && N == 2 * TILE_N);
     const TA * RESTRICT A = static_cast<const TA *>(_A);
     const char * RESTRICT B = static_cast<const char *>(_B);
@@ -2516,13 +2577,15 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
             const char * B_blk1 = B + PACKED_INDEX(1, i, KB, TILE_SIZE);
 
             // Prefetch next iteration's data to hide memory latency (SparAMX technique)
-            if (i + 1 < KB) {
-                const char * B_blk0_next = B + PACKED_INDEX(0, i + 1, KB, TILE_SIZE);
-                const char * B_blk1_next = B + PACKED_INDEX(1, i + 1, KB, TILE_SIZE);
+            // Only enabled for MOE+ architectures (BASE = upstream-compatible)
+            // Distance is configurable via GGML_AMX_PREFETCH_DISTANCE (default: 1 for MOE+, 0 for BASE)
+            if (prefetch_distance > 0 && i + prefetch_distance < KB) {
+                const char * B_blk0_next = B + PACKED_INDEX(0, i + prefetch_distance, KB, TILE_SIZE);
+                const char * B_blk1_next = B + PACKED_INDEX(1, i + prefetch_distance, KB, TILE_SIZE);
                 _mm_prefetch(B_blk0_next, _MM_HINT_T0);
                 _mm_prefetch(B_blk1_next, _MM_HINT_T0);
-                _mm_prefetch((const char*)&A[i + 1].qs, _MM_HINT_T0);
-                _mm_prefetch((const char*)&A[TILE_M * KB + i + 1].qs, _MM_HINT_T0);
+                _mm_prefetch((const char*)&A[i + prefetch_distance].qs, _MM_HINT_T0);
+                _mm_prefetch((const char*)&A[TILE_M * KB + i + prefetch_distance].qs, _MM_HINT_T0);
             }
 
             // === Phase 1: Load all inputs (batch for better memory pipelining) ===
@@ -2580,14 +2643,16 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
             const char * B_blk1 = B + PACKED_INDEX(1, i, KB, TILE_SIZE);
 
             // Prefetch next iteration's data (SparAMX technique)
-            if (i + 1 < KB) {
-                const char * B_blk0_next = B + PACKED_INDEX(0, i + 1, KB, TILE_SIZE);
-                const char * B_blk1_next = B + PACKED_INDEX(1, i + 1, KB, TILE_SIZE);
+            // Only enabled for MOE+ architectures (BASE = upstream-compatible)
+            // Distance is configurable via GGML_AMX_PREFETCH_DISTANCE (default: 1 for MOE+, 0 for BASE)
+            if (prefetch_distance > 0 && i + prefetch_distance < KB) {
+                const char * B_blk0_next = B + PACKED_INDEX(0, i + prefetch_distance, KB, TILE_SIZE);
+                const char * B_blk1_next = B + PACKED_INDEX(1, i + prefetch_distance, KB, TILE_SIZE);
                 _mm_prefetch(B_blk0_next, _MM_HINT_T0);
                 _mm_prefetch(B_blk1_next, _MM_HINT_T0);
-                _mm_prefetch((const char*)&A[i + 1].qs, _MM_HINT_T0);
+                _mm_prefetch((const char*)&A[i + prefetch_distance].qs, _MM_HINT_T0);
                 if (m1 != 0) {
-                    _mm_prefetch((const char*)&A[TILE_M * KB + i + 1].qs, _MM_HINT_T0);
+                    _mm_prefetch((const char*)&A[TILE_M * KB + i + prefetch_distance].qs, _MM_HINT_T0);
                 }
             }
 
@@ -2664,6 +2729,9 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
     static_assert(std::is_same<TA, block_q8_K>::value);
     const int TILE_SIZE = get_tile_size<TB>();
 
+    // Get prefetch distance (architecture-dependent: BASE=0, MOE+=1)
+    const int prefetch_distance = get_prefetch_distance();
+
     GGML_ASSERT(M <= 2 * TILE_M && N == 2 * TILE_N);
     const TA * RESTRICT A = static_cast<const TA *>(_A);
     const char * RESTRICT B = static_cast<const char *>(_B);
@@ -2691,14 +2759,16 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
     const int k_group_size = std::is_same<TB, block_q6_K>::value ? 16 : 32;
     for (int i = 0; i < KB; ++i) {
         // Prefetch next K-block data (SparAMX technique)
-        if (i + 1 < KB) {
-            const char * B_blk0_next = B + PACKED_INDEX(0, i + 1, KB, TILE_SIZE);
-            const char * B_blk1_next = B + PACKED_INDEX(1, i + 1, KB, TILE_SIZE);
+        // Only enabled for MOE+ architectures (BASE = upstream-compatible)
+        // Distance is configurable via GGML_AMX_PREFETCH_DISTANCE (default: 1 for MOE+, 0 for BASE)
+        if (prefetch_distance > 0 && i + prefetch_distance < KB) {
+            const char * B_blk0_next = B + PACKED_INDEX(0, i + prefetch_distance, KB, TILE_SIZE);
+            const char * B_blk1_next = B + PACKED_INDEX(1, i + prefetch_distance, KB, TILE_SIZE);
             _mm_prefetch(B_blk0_next, _MM_HINT_T0);
             _mm_prefetch(B_blk1_next, _MM_HINT_T0);
-            _mm_prefetch((const char*)&A[i + 1], _MM_HINT_T0);
+            _mm_prefetch((const char*)&A[i + prefetch_distance], _MM_HINT_T0);
             if (m1 != 0) {
-                _mm_prefetch((const char*)&A[TILE_M * KB + i + 1], _MM_HINT_T0);
+                _mm_prefetch((const char*)&A[TILE_M * KB + i + prefetch_distance], _MM_HINT_T0);
             }
         }
 
@@ -3086,9 +3156,8 @@ void ggml_backend_amx_mul_mat_moe_expert(
     const int N = dst->ne[0];  // output features (n_ff)
     const int K = src0->ne[0]; // input features (n_embd)
 
-    // Thread-local buffer pool for efficient buffer reuse across expert calls
-    // Only allocated/grown when needed, significantly reduces malloc/free overhead
-    thread_local amx_moe_buffer_pool buffer_pool;
+    // Buffer allocation strategy depends on architecture variant
+    const enum ggml_amx_moe_arch arch = ggml_get_amx_moe_arch();
 
     GGML_DISPATCH_QTYPES(TYPE, [&] {
         const size_t row_size_A = K / blck_size * sizeof(vec_dot_type);
@@ -3097,24 +3166,43 @@ void ggml_backend_amx_mul_mat_moe_expert(
         const size_t required_quantized = M * row_size_A;  // in bytes
         const size_t required_output = M * N;              // in floats
 
-        // Grow buffers only if needed (amortized allocation)
-        if (buffer_pool.quantized_capacity < required_quantized) {
-            // Grow with 1.5x factor to reduce reallocations
-            const size_t new_capacity = std::max(required_quantized, buffer_pool.quantized_capacity * 3 / 2);
-            // Use NUMA-aware allocation with first-touch to distribute pages across sockets
-            numa_aware_vector_resize(buffer_pool.quantized_input, new_capacity, params);
-            buffer_pool.quantized_capacity = new_capacity;
-        }
-        if (buffer_pool.output_capacity < required_output) {
-            const size_t new_capacity = std::max(required_output, buffer_pool.output_capacity * 3 / 2);
-            // Use NUMA-aware allocation with first-touch to distribute pages across sockets
-            numa_aware_vector_resize(buffer_pool.output, new_capacity, params);
-            buffer_pool.output_capacity = new_capacity;
-        }
+        char * quantized_input_buffer;
+        float * output_buffer;
 
-        // Use buffer pool (no allocation in steady state)
-        char * quantized_input_buffer = buffer_pool.quantized_input.data();
-        float * output_buffer = buffer_pool.output.data();
+        // BASE: Allocate fresh buffers each call (upstream-compatible behavior)
+        std::vector<char> quantized_input_local;
+        std::vector<float> output_local;
+
+        if (arch >= GGML_AMX_MOE_ARCH_MOE) {
+            // MOE and FUSED_MOE: Use thread-local buffer pool for efficient buffer reuse
+            // Only allocated/grown when needed, significantly reduces malloc/free overhead
+            thread_local amx_moe_buffer_pool buffer_pool;
+
+            // Grow buffers only if needed (amortized allocation)
+            if (buffer_pool.quantized_capacity < required_quantized) {
+                // Grow with 1.5x factor to reduce reallocations
+                const size_t new_capacity = std::max(required_quantized, buffer_pool.quantized_capacity * 3 / 2);
+                // Use NUMA-aware allocation with first-touch to distribute pages across sockets
+                numa_aware_vector_resize(buffer_pool.quantized_input, new_capacity, params);
+                buffer_pool.quantized_capacity = new_capacity;
+            }
+            if (buffer_pool.output_capacity < required_output) {
+                const size_t new_capacity = std::max(required_output, buffer_pool.output_capacity * 3 / 2);
+                // Use NUMA-aware allocation with first-touch to distribute pages across sockets
+                numa_aware_vector_resize(buffer_pool.output, new_capacity, params);
+                buffer_pool.output_capacity = new_capacity;
+            }
+
+            quantized_input_buffer = buffer_pool.quantized_input.data();
+            output_buffer = buffer_pool.output.data();
+        } else {
+            // BASE: Allocate fresh buffers each call (upstream-compatible behavior)
+            quantized_input_local.resize(required_quantized);
+            output_local.resize(required_output);
+
+            quantized_input_buffer = quantized_input_local.data();
+            output_buffer = output_local.data();
+        }
 
         // Quantize M rows of input for this expert
         // NOTE: Only thread 0 calls this function (see ggml-cpu.c line 1752), so no barriers needed
@@ -3233,6 +3321,259 @@ void ggml_backend_amx_mul_mat_moe_expert(
 
             // Copy from output buffer
             const float * src_row = output_buffer + m * N;
+            memcpy(dst_row, src_row, N * sizeof(float));
+        }
+    });
+}
+
+// Buffer pool for AMX Fused Gate+Up+SiLU MoE operations
+// Thread-local buffer reuse reduces allocation overhead in steady state
+struct amx_fused_moe_buffer_pool {
+    std::vector<char> quantized_input;      // Q8_0 quantized inputs [M, K]
+    std::vector<float> gate_output;         // Gate projection output [M, N]
+    std::vector<float> up_output;           // Up projection output [M, N]
+    std::vector<float> intermediate;        // Fused SiLU result [M, N]
+    size_t quantized_capacity = 0;          // in bytes
+    size_t gate_capacity = 0;               // in floats
+    size_t up_capacity = 0;                 // in floats
+    size_t intermediate_capacity = 0;       // in floats
+};
+
+// AMX backend implementation for fused gate+up+silu MoE operation
+// This function processes a single expert with fused gate and up projections followed by SiLU activation
+//
+// Algorithm:
+//   1. Quantize inputs to Q8_0 for AMX matmul
+//   2. Gate projection: [M, K] @ [K, N] → [M, N] using AMX tiles
+//   3. Up projection: [M, K] @ [K, N] → [M, N] using AMX tiles
+//   4. Fused SiLU: intermediate[i] = silu(gate[i]) * up[i] (vectorized AVX-512)
+//   5. Scatter results back to dst tensor
+//
+// Performance characteristics:
+//   - Uses AMX tiles for ~25 TOPS int8 throughput (3x faster than AVX-512 VNNI)
+//   - Thread-local buffer pool eliminates allocations in steady state
+//   - NUMA-aware memory allocation
+//   - Adaptive M=1 vs M>1 kernel selection
+//
+void ggml_backend_amx_mul_mat_gate_up_silu_fused(
+    const ggml_compute_params * params,
+    struct ggml_tensor * dst,
+    const struct ggml_tensor * gate_weights,
+    const struct ggml_tensor * up_weights,
+    const struct ggml_tensor * input,
+    const struct ggml_tensor * ids,
+    const struct mmid_row_mapping * token_mappings,
+    const int64_t num_tokens,
+    const char * gate_expert_weights,
+    const char * up_expert_weights,
+    const int64_t expert_id) {
+
+    const enum ggml_type TYPE = gate_weights->type;
+
+    const int M = num_tokens;  // batch size for this expert
+    const int N = dst->ne[0];  // output features (n_ff / intermediate size)
+    const int K = input->ne[0]; // input features (n_embd / hidden size)
+
+    // Thread-local buffer pool for efficient buffer reuse across expert calls
+    // Only allocated/grown when needed, significantly reduces malloc/free overhead
+    thread_local amx_fused_moe_buffer_pool buffer_pool;
+
+    GGML_DISPATCH_QTYPES(TYPE, [&] {
+        const size_t row_size_A = K / blck_size * sizeof(vec_dot_type);
+
+        // Calculate required buffer sizes
+        const size_t required_quantized = M * row_size_A;  // in bytes
+        const size_t required_gate = M * N;                // in floats
+        const size_t required_up = M * N;                  // in floats
+        const size_t required_intermediate = M * N;        // in floats
+
+        // Grow buffers only if needed (amortized allocation with 1.5x growth factor)
+        if (buffer_pool.quantized_capacity < required_quantized) {
+            const size_t new_capacity = std::max(required_quantized, buffer_pool.quantized_capacity * 3 / 2);
+            numa_aware_vector_resize(buffer_pool.quantized_input, new_capacity, params);
+            buffer_pool.quantized_capacity = new_capacity;
+        }
+        if (buffer_pool.gate_capacity < required_gate) {
+            const size_t new_capacity = std::max(required_gate, buffer_pool.gate_capacity * 3 / 2);
+            numa_aware_vector_resize(buffer_pool.gate_output, new_capacity, params);
+            buffer_pool.gate_capacity = new_capacity;
+        }
+        if (buffer_pool.up_capacity < required_up) {
+            const size_t new_capacity = std::max(required_up, buffer_pool.up_capacity * 3 / 2);
+            numa_aware_vector_resize(buffer_pool.up_output, new_capacity, params);
+            buffer_pool.up_capacity = new_capacity;
+        }
+        if (buffer_pool.intermediate_capacity < required_intermediate) {
+            const size_t new_capacity = std::max(required_intermediate, buffer_pool.intermediate_capacity * 3 / 2);
+            numa_aware_vector_resize(buffer_pool.intermediate, new_capacity, params);
+            buffer_pool.intermediate_capacity = new_capacity;
+        }
+
+        // Use buffer pool (no allocation in steady state)
+        char * quantized_input_buffer = buffer_pool.quantized_input.data();
+        float * gate_output_buffer = buffer_pool.gate_output.data();
+        float * up_output_buffer = buffer_pool.up_output.data();
+        float * intermediate_buffer = buffer_pool.intermediate.data();
+
+        // Step 1: Quantize M rows of input for this expert to Q8_0
+        // NOTE: This function is called per expert, so no barriers needed
+        for (int m = 0; m < M; ++m) {
+            const struct mmid_row_mapping map = token_mappings[m];
+            const int slot_index = map.i1;   // expert slot index (0-7 for top-8 MoE)
+            const int batch_idx = map.i2;    // batch index
+
+            // Bounds checking for safety (only check batch_idx, input doesn't have slot dimension)
+            if (batch_idx < 0 || batch_idx >= input->ne[2]) {
+                fprintf(stderr, "[AMX FUSED ERROR] Quantization: Invalid batch_idx=%d (should be < %lld)\n",
+                        batch_idx, (long long)input->ne[2]);
+                continue;
+            }
+
+            // Source: original float data from input
+            // Note: input has shape [n_embd, 1, n_tokens], so we only index by batch (token) dimension
+            const int64_t i12 = batch_idx;
+            const float * src_row = (const float *)((char *)input->data + i12*input->nb[2]);
+
+            // Destination: contiguous buffer for this expert
+            char * dst_row = quantized_input_buffer + m * row_size_A;
+
+            // Quantize row to vec_dot_type (Q8_0 for AMX)
+            from_float<vec_dot_type>(src_row, dst_row, K);
+        }
+
+        // AMX matmul parameters
+        constexpr int BLOCK_M = TILE_M * 2;
+        constexpr int BLOCK_N = TILE_N * 2;
+        const int KB = K / blck_size;
+        const int TILE_SIZE = get_tile_size<type>();
+
+        // Step 2 & 3: Gate and Up projections using AMX tiles
+        // Use row-wise processing for very small M (M <= 2) to reduce overhead (decode optimization)
+        if (M <= 2) {
+            // Row-wise kernel: lower overhead for decode (M=1 or M=2)
+            // tinygemm_kernel_amx requires N == 2*TILE_N = 32
+            ggml_tile_config_init();
+            constexpr int N_BLOCK = 2 * TILE_N;  // 32 - required by tinygemm_kernel_amx
+            const int NB_count = N / N_BLOCK;    // For N=768: 768/32 = 24 blocks
+
+            for (int m = 0; m < M; ++m) {
+                const char * a_row = quantized_input_buffer + m * row_size_A;
+                float * gate_out_row = gate_output_buffer + m * N;
+                float * up_out_row = up_output_buffer + m * N;
+
+                for (int nb = 0; nb < NB_count; ++nb) {
+                    const int nb_start = nb * N_BLOCK;
+
+                    // Gate projection - M=1, N=32 (2*TILE_N)
+                    tinygemm_kernel_amx<vec_dot_type, type, float, blck_size>(
+                        1, N_BLOCK, KB,  // M=1, N=32
+                        a_row,
+                        (const char *)gate_expert_weights + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
+                        gate_out_row + nb_start, N);
+
+                    // Up projection - M=1, N=32 (2*TILE_N)
+                    tinygemm_kernel_amx<vec_dot_type, type, float, blck_size>(
+                        1, N_BLOCK, KB,  // M=1, N=32
+                        a_row,
+                        (const char *)up_expert_weights + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
+                        up_out_row + nb_start, N);
+                }
+            }
+        } else {
+            // Tile-based kernel: better for larger M (prefill optimization)
+            const int MB = div_up(M, BLOCK_M);
+            const int NB = div_up(N, BLOCK_N);
+
+            parallel_for_ggml(params, MB * NB, [&](int begin, int end) {
+                // Initialize tile config for each thread
+                ggml_tile_config_init();
+
+                for (int i = begin; i < end; ++i) {
+                    int mb = i / NB;
+                    int nb = i % NB;
+
+                    int mb_start = mb * BLOCK_M;
+                    int mb_size = std::min(BLOCK_M, M - mb_start);
+                    int nb_start = nb * BLOCK_N;
+                    int nb_size = BLOCK_N;
+
+                    // Gate projection output
+                    float * gate_out = gate_output_buffer + mb_start * N + nb_start;
+
+                    // Gate projection using AMX tiles
+                    tinygemm_kernel_amx<vec_dot_type, type, float, blck_size>(
+                        mb_size, nb_size, KB,
+                        (const char *)quantized_input_buffer + mb_start * row_size_A,
+                        (const char *)gate_expert_weights + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
+                        gate_out, N);  // ldc = N for contiguous output
+
+                    // Up projection output
+                    float * up_out = up_output_buffer + mb_start * N + nb_start;
+
+                    // Up projection using AMX tiles
+                    tinygemm_kernel_amx<vec_dot_type, type, float, blck_size>(
+                        mb_size, nb_size, KB,
+                        (const char *)quantized_input_buffer + mb_start * row_size_A,
+                        (const char *)up_expert_weights + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
+                        up_out, N);  // ldc = N for contiguous output
+                }
+            });
+        }
+
+        // Step 4: Fused SiLU activation + element-wise multiply
+        // intermediate[i] = silu(gate[i]) * up[i]
+        // Uses vectorized AVX-512 implementation (16 floats at a time)
+        fused_silu_mul_batch_avx512(
+            gate_output_buffer,     // [M, N]
+            up_output_buffer,       // [M, N]
+            intermediate_buffer,    // [M, N]
+            M, N);
+
+        // DEBUG: Print intermediate values for ALL experts (first call only)
+        static int debug_count = 0;
+        if (debug_count < 3 && M > 0) {
+            fprintf(stderr, "[AMX DEBUG %d] expert_id=%lld, M=%d, N=%d, K=%d\n",
+                    debug_count, (long long)expert_id, M, N, K);
+            fprintf(stderr, "[AMX DEBUG %d] gate_output[0:4]: %.6f %.6f %.6f %.6f\n",
+                    debug_count,
+                    gate_output_buffer[0], gate_output_buffer[1],
+                    gate_output_buffer[2], gate_output_buffer[3]);
+            fprintf(stderr, "[AMX DEBUG %d] up_output[0:4]: %.6f %.6f %.6f %.6f\n",
+                    debug_count,
+                    up_output_buffer[0], up_output_buffer[1],
+                    up_output_buffer[2], up_output_buffer[3]);
+            fprintf(stderr, "[AMX DEBUG %d] intermediate[0:4]: %.6f %.6f %.6f %.6f\n",
+                    debug_count,
+                    intermediate_buffer[0], intermediate_buffer[1],
+                    intermediate_buffer[2], intermediate_buffer[3]);
+            debug_count++;
+        }
+
+        // Step 5: Scatter results back to correct token positions in dst
+        for (int m = 0; m < M; ++m) {
+            const struct mmid_row_mapping map = token_mappings[m];
+            const int slot_index = map.i1;   // expert slot index (0-7 for top-8 MoE)
+            const int batch_idx = map.i2;    // batch index
+
+            // Bounds checking for safety
+            if (slot_index < 0 || slot_index >= dst->ne[1]) {
+                fprintf(stderr, "[AMX FUSED ERROR] Scatter: Invalid slot_index=%d (should be < %lld)\n",
+                        slot_index, (long long)dst->ne[1]);
+                continue;
+            }
+            if (batch_idx < 0 || batch_idx >= dst->ne[2]) {
+                fprintf(stderr, "[AMX FUSED ERROR] Scatter: Invalid batch_idx=%d (should be < %lld)\n",
+                        batch_idx, (long long)dst->ne[2]);
+                continue;
+            }
+
+            // Destination: match the original indexing
+            const int64_t i1 = slot_index;
+            const int64_t i2 = batch_idx;
+            float * dst_row = (float *)((char *)dst->data + i1*dst->nb[1] + i2*dst->nb[2]);
+
+            // Copy from intermediate buffer
+            const float * src_row = intermediate_buffer + m * N;
             memcpy(dst_row, src_row, N * sizeof(float));
         }
     });

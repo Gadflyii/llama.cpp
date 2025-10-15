@@ -26,6 +26,11 @@
 
 #define UNUSED GGML_UNUSED
 
+// Forward declaration for AMX buffer type
+#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+extern ggml_backend_buffer_type_t ggml_backend_amx_buffer_type();
+#endif
+
 static inline int nearest_int(float fval) {
     assert(fabsf(fval) <= 4194303.f);
     float val = fval + 12582912.f;
@@ -1619,7 +1624,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 forward_mul_mat_id(params, op);
                 return true;
             case GGML_OP_MUL_MAT_GATE_UP_SILU:
-                forward_mul_mat_gate_up_silu(params, op);
+                if (can_use_amx_fused_backend(op->src[0], op->src[1])) {
+                    fprintf(stderr, "[DISPATCH] Using AMX path\n");
+                    forward_mul_mat_gate_up_silu_amx(params, op);
+                } else {
+                    fprintf(stderr, "[DISPATCH] Using baseline path\n");
+                    forward_mul_mat_gate_up_silu(params, op);
+                }
                 return true;
             default:
                 // GGML_ABORT("fatal error");
@@ -1831,7 +1842,167 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 #undef MMID_MATRIX_ROW
     }
 
-    void forward_mul_mat_gate_up_silu(ggml_compute_params * params, ggml_tensor * op) {
+    // AMX Backend Integration for Fused Gate+Up+SiLU
+    // Check if AMX backend should be used for fused gate+up+silu operation
+    static inline bool can_use_amx_fused_backend(const ggml_tensor * gate_weights, const ggml_tensor * up_weights) {
+        static bool first_call = true;
+
+        // Must have AMX support
+        if (!ggml_cpu_has_amx_int8()) {
+            if (first_call) fprintf(stderr, "[AMX CHECK] No AMX support\n");
+            first_call = false;
+            return false;
+        }
+
+        // Check if weights are allocated in AMX buffer (not CPU_REPACK)
+        // AMX buffer uses convert_B_packed_format() with PACKED_INDEX layout
+        // CPU_REPACK buffer uses repack_q4_0_to_q4_0_8_bl() with different layout
+        const bool gate_is_amx = gate_weights->buffer &&
+                                 strcmp(ggml_backend_buffer_name(gate_weights->buffer), "AMX") == 0;
+        const bool up_is_amx = up_weights->buffer &&
+                               strcmp(ggml_backend_buffer_name(up_weights->buffer), "AMX") == 0;
+
+        if (!gate_is_amx || !up_is_amx) {
+            if (first_call) {
+                fprintf(stderr, "[AMX CHECK] Weights not in AMX buffer format (gate=%s, up=%s)\n",
+                        gate_is_amx ? "AMX" : "other",
+                        up_is_amx ? "AMX" : "other");
+                fprintf(stderr, "[AMX CHECK] Using baseline path with CPU_REPACK format\n");
+                fprintf(stderr, "[AMX CHECK] To use AMX: Model will be repacked in AMX format on next load\n");
+            }
+            first_call = false;
+            return false;
+        }
+
+        // Verify quantization type supports AMX
+        if (!qtype_has_amx_kernels(gate_weights->type) || !qtype_has_amx_kernels(up_weights->type)) {
+            if (first_call) {
+                fprintf(stderr, "[AMX CHECK] Weight types don't support AMX (gate=%d, up=%d)\n",
+                        gate_weights->type, up_weights->type);
+            }
+            first_call = false;
+            return false;
+        }
+
+        if (first_call) {
+            fprintf(stderr, "[AMX CHECK] ✓ Using AMX fused path with AMX-packed weights!\n");
+            fprintf(stderr, "[AMX CHECK] ✓ Gate: %s, Up: %s\n",
+                    ggml_type_name(gate_weights->type),
+                    ggml_type_name(up_weights->type));
+        }
+        first_call = false;
+        return true;  // Use AMX tiles with AMX-packed weights
+    }
+
+    // AMX wrapper: processes all experts using native AMX tiles
+    // For MOE architecture with M<=2, falls back to baseline (separate gate/up projections)
+    // For MOE with M>2 or FUSED_MOE, uses fused AMX implementation
+    static void forward_mul_mat_gate_up_silu_amx(ggml_compute_params * params, ggml_tensor * op) {
+        const ggml_tensor * gate_weights = op->src[0];
+        const ggml_tensor * up_weights   = op->src[1];
+        const ggml_tensor * input        = op->src[2];
+        const ggml_tensor * ids          = op->src[3];
+        ggml_tensor *       dst          = op;
+
+        const int64_t ne02 = gate_weights->ne[2];  // n_experts
+        const int64_t ne12 = input->ne[2];  // n_tokens
+
+        const size_t nb02 = gate_weights->nb[2];  // Stride between experts
+
+        const int ith = params->ith;
+        const int nth = params->nth;
+
+        const int n_ids = ids->ne[0];  // n_expert_used
+        const int n_as  = ne02;        // n_expert_total
+
+        // Workspace for matrix_row_counts and matrix_rows
+        // Note: Using global mmid_row_mapping struct from mmq.h
+
+        auto * wdata = (char *)params->wdata;
+        auto * matrix_row_counts = (int64_t *) wdata;
+        auto * matrix_rows = (::mmid_row_mapping *) (matrix_row_counts + n_as);
+
+        // Build expert-token mapping (thread 0 only)
+        if (ith == 0) {
+            memset(matrix_row_counts, 0, n_as * sizeof(int64_t));
+
+            for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                for (int id = 0; id < n_ids; ++id) {
+                    const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+                    GGML_ASSERT(i02 >= 0 && i02 < n_as);
+
+                    const int64_t row_count = matrix_row_counts[i02];
+                    matrix_rows[i02 * ne12 + row_count].i1 = id;
+                    matrix_rows[i02 * ne12 + row_count].i2 = (int32_t)iid1;
+                    matrix_row_counts[i02] += 1;
+                }
+            }
+        }
+
+        ggml_barrier(params->threadpool);
+
+        // Check for MOE hybrid threshold: M<=2 should use baseline path
+        const enum ggml_amx_moe_arch arch = ggml_get_amx_moe_arch();
+        bool use_baseline = false;
+
+        if (arch == GGML_AMX_MOE_ARCH_MOE) {
+            // For MOE, check if maximum tokens per expert <= 2
+            int64_t max_tokens = 0;
+            for (int cur_a = 0; cur_a < n_as; cur_a++) {
+                if (matrix_row_counts[cur_a] > max_tokens) {
+                    max_tokens = matrix_row_counts[cur_a];
+                }
+            }
+            use_baseline = (max_tokens <= 2);
+
+            static bool first_dispatch = true;
+            if (first_dispatch) {
+                fprintf(stderr, "[MOE HYBRID] max_tokens=%lld, using %s path\n",
+                        (long long)max_tokens, use_baseline ? "BASELINE" : "FUSED AMX");
+                first_dispatch = false;
+            }
+        }
+
+        if (use_baseline) {
+            // MOE with M<=2: Use baseline separate gate/up projections for better decode performance
+            forward_mul_mat_gate_up_silu(params, op);
+            return;
+        }
+
+        // Process each expert using AMX fused backend (multi-threaded across experts)
+        for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
+            const int64_t num_tokens = matrix_row_counts[cur_a];
+
+            if (num_tokens == 0) {
+                continue;
+            }
+
+            // Expert weight pointers
+            const char * gate_expert_weights = (const char *)gate_weights->data + cur_a * nb02;
+            const char * up_expert_weights   = (const char *)up_weights->data + cur_a * nb02;
+
+            // Token mappings for this expert
+            const struct mmid_row_mapping * token_mappings = matrix_rows + cur_a * ne12;
+
+            // Use fused AMX implementation (MOE with M>2, or FUSED_MOE always)
+            ggml_backend_amx_mul_mat_gate_up_silu_fused(
+                params,
+                dst,
+                gate_weights,
+                up_weights,
+                input,
+                ids,
+                token_mappings,
+                num_tokens,
+                gate_expert_weights,
+                up_expert_weights,
+                cur_a);
+        }
+
+        ggml_barrier(params->threadpool);
+    }
+
+    static void forward_mul_mat_gate_up_silu(ggml_compute_params * params, ggml_tensor * op) {
         const ggml_tensor * gate_weights = op->src[0];  // Q4_0, [dim_model, dim_ffn, n_experts]
         const ggml_tensor * up_weights   = op->src[1];  // Q4_0, [dim_model, dim_ffn, n_experts]
         const ggml_tensor * input        = op->src[2];  // F32, [dim_model, 1, n_tokens]
@@ -2247,16 +2418,49 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                 && op->src[1]->buffer
                 && (ggml_n_dims(op->src[0]) == 3)
                 && (ggml_n_dims(op->src[1]) == 3)
-                && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
-                && op->src[1]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
-                && ggml_repack_get_optimal_repack_type(op->src[0])
-                && ggml_repack_get_optimal_repack_type(op->src[1])
                 ) {
-            if (op->src[2]->buffer && !ggml_backend_buft_is_host(op->src[2]->buffer->buft)) {
-                return false;
+            // Accept both CPU_REPACK and AMX buffers for gate/up weights
+            // AMX buffer is used for fused_moe architecture
+            static bool first_check = true;
+            if (first_check) {
+                fprintf(stderr, "[REPACK SUPPORTS_OP] Checking MUL_MAT_GATE_UP_SILU\n");
+                fprintf(stderr, "[REPACK SUPPORTS_OP] gate buffer: %s\n",
+                        ggml_backend_buffer_name(op->src[0]->buffer));
+                fprintf(stderr, "[REPACK SUPPORTS_OP] up buffer: %s\n",
+                        ggml_backend_buffer_name(op->src[1]->buffer));
+                first_check = false;
             }
-            if (op->src[2]->type == GGML_TYPE_F32) {
-                return true;
+
+            const bool gate_ok = op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
+#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+                                  || op->src[0]->buffer->buft == ggml_backend_amx_buffer_type()
+#endif
+                                  ;
+            const bool up_ok = op->src[1]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
+#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+                                || op->src[1]->buffer->buft == ggml_backend_amx_buffer_type()
+#endif
+                                ;
+
+            if (gate_ok && up_ok) {
+                // For CPU_REPACK buffers, verify repack type is supported
+                // For AMX buffers, skip this check (AMX has its own format)
+                bool gate_repack_ok = true, up_repack_ok = true;
+                if (op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
+                    gate_repack_ok = ggml_repack_get_optimal_repack_type(op->src[0]) != nullptr;
+                }
+                if (op->src[1]->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
+                    up_repack_ok = ggml_repack_get_optimal_repack_type(op->src[1]) != nullptr;
+                }
+
+                if (gate_repack_ok && up_repack_ok) {
+                    if (op->src[2]->buffer && !ggml_backend_buft_is_host(op->src[2]->buffer->buft)) {
+                        return false;
+                    }
+                    if (op->src[2]->type == GGML_TYPE_F32) {
+                        return true;
+                    }
+                }
             }
         }
         return false;
@@ -2268,8 +2472,29 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                 return (ggml::cpu::tensor_traits *) op->src[0]->extra;
             }
         } else if (op->op == GGML_OP_MUL_MAT_GATE_UP_SILU) {
-            if (op->src[0]->buffer && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
-                return (ggml::cpu::tensor_traits *) op->src[0]->extra;
+            // Accept both CPU_REPACK and AMX buffers
+            if (op->src[0]->buffer && op->src[1]->buffer) {
+                const bool gate_is_repack = op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type();
+                const bool up_is_repack = op->src[1]->buffer->buft == ggml_backend_cpu_repack_buffer_type();
+#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+                const bool gate_is_amx = op->src[0]->buffer->buft == ggml_backend_amx_buffer_type();
+                const bool up_is_amx = op->src[1]->buffer->buft == ggml_backend_amx_buffer_type();
+#else
+                const bool gate_is_amx = false;
+                const bool up_is_amx = false;
+#endif
+                // Return trait if both weights are in compatible buffers (either both repack or both AMX)
+                if ((gate_is_repack && up_is_repack) || (gate_is_amx && up_is_amx)) {
+                    // For CPU_REPACK, use the weight's extra trait
+                    // For AMX, weights don't have traits, so return a dummy trait to claim the operation
+                    if (gate_is_repack) {
+                        return (ggml::cpu::tensor_traits *) op->src[0]->extra;
+                    } else {
+                        // AMX buffer - return a static trait that will handle dispatch
+                        static ggml::cpu::repack::tensor_traits<block_q4_0, 8, 8, GGML_TYPE_Q8_0> amx_fused_trait;
+                        return &amx_fused_trait;
+                    }
+                }
             }
         }
         return nullptr;

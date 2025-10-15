@@ -40,6 +40,19 @@ void ggml_backend_amx_mul_mat_moe_expert(
     const void * wdata,
     const size_t row_size);
 
+void ggml_backend_amx_mul_mat_gate_up_silu_fused(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst,
+    const struct ggml_tensor * gate_weights,
+    const struct ggml_tensor * up_weights,
+    const struct ggml_tensor * input,
+    const struct ggml_tensor * ids,
+    const struct mmid_row_mapping * token_mappings,
+    const int64_t num_tokens,
+    const char * gate_expert_weights,
+    const char * up_expert_weights,
+    const int64_t expert_id);
+
 void ggml_backend_amx_mul_mat_moe_batch(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,

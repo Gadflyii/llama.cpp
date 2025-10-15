@@ -31,6 +31,13 @@ class tensor_traits : public ggml::cpu::tensor_traits {
             ggml_backend_amx_mul_mat(params, op);
             return true;
         }
+        // MUL_MAT_GATE_UP_SILU handled by repack backend's dispatch
+        // which checks buffer types and calls ggml_backend_amx_mul_mat_gate_up_silu_fused
+        if (op->op == GGML_OP_MUL_MAT_GATE_UP_SILU) {
+            // Delegate to repack backend - it will check if AMX path should be used
+            // and call the appropriate implementation
+            return false;  // Let repack backend handle it
+        }
         return false;
     }
 };
@@ -51,6 +58,20 @@ static void * ggml_backend_amx_buffer_get_base(ggml_backend_buffer_t buffer) {
 }
 
 static enum ggml_status ggml_backend_amx_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
+    // For MOE and FUSED_MOE gate/up expert weights, DON'T set AMX traits
+    // This allows the repack backend to handle dispatch for MUL_MAT_GATE_UP_SILU
+    // The repack backend will check buffer types and call AMX implementation (or baseline for M<=2)
+    const enum ggml_amx_moe_arch arch = ggml_get_amx_moe_arch();
+    if (arch == GGML_AMX_MOE_ARCH_MOE || arch == GGML_AMX_MOE_ARCH_FUSED_MOE) {
+        const char * name = tensor->name;
+        if ((strstr(name, ".ffn_gate_exps.weight") != nullptr) ||
+            (strstr(name, ".ffn_up_exps.weight") != nullptr)) {
+            // Don't set AMX traits for these tensors
+            tensor->extra = nullptr;
+            return GGML_STATUS_SUCCESS;
+        }
+    }
+
     tensor->extra = (void *) ggml::cpu::amx::get_tensor_traits(buffer, tensor);
 
     GGML_UNUSED(buffer);
@@ -218,7 +239,59 @@ static size_t ggml_backend_amx_buffer_type_get_alignment(ggml_backend_buffer_typ
 
 namespace ggml::cpu::amx {
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
+    // Helper: Check if tensor is an MoE expert gate or up weight by name pattern
+    static bool is_moe_expert_gate_or_up_weight(const struct ggml_tensor * tensor) {
+        if (!tensor || !tensor->name) {
+            return false;
+        }
+
+        const char * name = tensor->name;
+
+        // Pattern for PACKED expert weights (all experts in one tensor):
+        // - blk.X.ffn_gate_exps.weight → Gate weights for ALL experts
+        // - blk.X.ffn_up_exps.weight   → Up weights for ALL experts
+        //
+        // Pattern for INDIVIDUAL expert weights (one tensor per expert):
+        // - blk.X.ffn.experts.Y.gate_proj.weight
+        // - blk.X.ffn.experts.Y.up_proj.weight
+
+        // Check packed expert weights (most common for fused_moe)
+        if (strstr(name, ".ffn_gate_exps.weight") != nullptr ||
+            strstr(name, ".ffn_up_exps.weight") != nullptr) {
+            return true;
+        }
+
+        // Check individual expert weights (alternative format)
+        bool is_expert_weight = (strstr(name, ".ffn.experts.") != nullptr) ||
+                                (strstr(name, ".ffn_experts.") != nullptr);
+        bool is_gate_or_up = (strstr(name, ".gate_proj.weight") != nullptr) ||
+                             (strstr(name, ".up_proj.weight") != nullptr);
+
+        return is_expert_weight && is_gate_or_up;
+    }
+
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
+        // MOE and FUSED_MOE: Check if this is an MoE expert gate/up weight during model loading
+        // This runs BEFORE the operation is built, so we detect by tensor name
+        const enum ggml_amx_moe_arch arch = ggml_get_amx_moe_arch();
+        if (arch == GGML_AMX_MOE_ARCH_MOE || arch == GGML_AMX_MOE_ARCH_FUSED_MOE) {
+            // Check src[0] (weight tensor) - during model loading, dummy ops are created to test buffer support
+            if (op->src[0]) {
+                if (is_moe_expert_gate_or_up_weight(op->src[0])) {
+                    if (qtype_has_amx_kernels(op->src[0]->type)) {
+                        static bool first_detection = true;
+                        if (first_detection) {
+                            fprintf(stderr, "[AMX BUFFER] ✓ Detected MoE expert gate/up weight: %s\n", op->src[0]->name);
+                            fprintf(stderr, "[AMX BUFFER] ✓ Selecting AMX buffer for %s architecture\n",
+                                    arch == GGML_AMX_MOE_ARCH_MOE ? "moe (hybrid)" : "fused_moe");
+                            first_detection = false;
+                        }
+                        return true;  // Use AMX buffer for this weight
+                    }
+                }
+            }
+        }
+
         // handle only 2d gemm for now
         auto is_contiguous_2d = [](const struct ggml_tensor * t) {
             return ggml_is_contiguous(t) && t->ne[3] == 1 && t->ne[2] == 1;
@@ -239,6 +312,31 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                 return true;
             }
         }
+
+        // Support MUL_MAT_GATE_UP_SILU for buffer selection only (not runtime dispatch)
+        // At runtime, repack backend handles dispatch to AMX or baseline
+        if (op->op == GGML_OP_MUL_MAT_GATE_UP_SILU) {
+            // Enable for both MOE (hybrid) and FUSED_MOE architectures
+            const enum ggml_amx_moe_arch arch = ggml_get_amx_moe_arch();
+            if (arch == GGML_AMX_MOE_ARCH_MOE || arch == GGML_AMX_MOE_ARCH_FUSED_MOE) {
+                // During model loading (buffer selection): buffers are null
+                // During runtime dispatch: buffers are allocated
+                // We only want to claim this operation for buffer selection, not dispatch
+                if (op->src[0] && op->src[1] && !op->src[0]->buffer && !op->src[1]->buffer) {
+                    // Buffer selection phase - claim it to use AMX buffer
+                    if (qtype_has_amx_kernels(op->src[0]->type) &&
+                        qtype_has_amx_kernels(op->src[1]->type) &&
+                        op->ne[0] % (TILE_N * 2) == 0) {
+                        return true;
+                    }
+                }
+                // Runtime dispatch phase - return false to let repack backend handle it
+                if (op->src[0] && op->src[1] && op->src[0]->buffer && op->src[1]->buffer) {
+                    return false;  // Let repack backend dispatch to AMX or baseline
+                }
+            }
+        }
+
         return false;
     }
 
