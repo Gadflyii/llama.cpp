@@ -3326,6 +3326,129 @@ void ggml_backend_amx_mul_mat_moe_expert(
     });
 }
 
+// AMX Native Fused Gate+Up+SiLU Kernel for M=1 Decode
+// Based on SGlang's tinygemm_kernel_nn2 pattern:
+//   - Single KB loop (load A tiles once)
+//   - Dual accumulators (gate and up)
+//   - Inline SiLU fusion using existing fused_silu_mul_batch_avx512
+//
+// This replaces 48 kernel calls (24 gate + 24 up) with a single optimized path
+template<typename TA, typename TB>
+static void amx_fused_gate_up_silu_kernel_m1(
+    int N,                      // Intermediate size (e.g., 768)
+    int KB,                     // K blocks after quantization
+    const char* A,              // Input: quantized [1, K]
+    const void* B_gate,         // Gate weights: packed expert weights
+    const void* B_up,           // Up weights: packed expert weights
+    float* gate_tmp,            // Temp buffer for gate output [N]
+    float* up_tmp,              // Temp buffer for up output [N]
+    float* C_intermediate,      // Output: [1, N] - SiLU fused
+    int64_t TILE_SIZE           // Packed tile size
+) {
+    constexpr int TILE_M_LOCAL = 1;   // M=1 for decode
+    // AMX buffer contains INT8 packed data - NO unpacking needed
+    constexpr bool need_unpack = false;  // Force false for AMX INT8 buffer
+    const int prefetch_distance = get_prefetch_distance();
+
+    const TA* RESTRICT A_typed = reinterpret_cast<const TA*>(A);
+    const int lda = KB * sizeof(TA);
+
+    // Temporary buffers for unpacking
+    static thread_local char tile_buf[TILE_N * TILE_K * 16] __attribute__((aligned(64)));
+
+    // Process N in blocks of 2*TILE_N (32 elements) to match packed B format
+    // Each packed block contains two TILE_N tiles
+    constexpr int N_BLOCK = 2 * TILE_N;  // 32
+    const int NB_count = N / N_BLOCK;    // For N=768: 768/32 = 24 blocks
+
+    for (int nb = 0; nb < NB_count; ++nb) {
+        const int nb_start = nb * N_BLOCK;  // Start of 32-element block
+
+        // Process two TILE_N=16 tiles within this 32-element block
+        for (int tile_idx = 0; tile_idx < 2; ++tile_idx) {
+            const int tile_start = nb_start + tile_idx * TILE_N;
+
+            // Accumulator buffers for storing tile results
+            static thread_local int32_t acc_gate[TILE_M_LOCAL * TILE_N] __attribute__((aligned(64)));
+            static thread_local int32_t acc_up[TILE_M_LOCAL * TILE_N] __attribute__((aligned(64)));
+
+            // Zero AMX tile registers before accumulation
+            _tile_zero(TMM4);  // Gate accumulator
+            _tile_zero(TMM6);  // Up accumulator
+
+            // Get pointers to B for this tile within the N block
+            // nb*2 because packed format stores in 2*TILE_N blocks
+            // tile_idx selects which of the two TILE_N tiles within the block
+            const char* B_gate_nb = (const char*)B_gate + PACKED_INDEX(nb * 2 + tile_idx, 0, KB, TILE_SIZE);
+            const char* B_up_nb = (const char*)B_up + PACKED_INDEX(nb * 2 + tile_idx, 0, KB, TILE_SIZE);
+
+        // ===== SINGLE KB LOOP - CRITICAL OPTIMIZATION =====
+        // Load A tiles ONCE, use for both gate and up
+        for (int k = 0; k < KB; ++k) {
+            // Prefetch ahead
+            if (prefetch_distance > 0 && k + prefetch_distance < KB) {
+                _mm_prefetch(B_gate_nb + PACKED_INDEX(0, k + prefetch_distance, KB, TILE_SIZE), _MM_HINT_T0);
+                _mm_prefetch(B_up_nb + PACKED_INDEX(0, k + prefetch_distance, KB, TILE_SIZE), _MM_HINT_T0);
+                _mm_prefetch((const char*)&A_typed[k + prefetch_distance].qs, _MM_HINT_T0);
+            }
+
+            // Load A tile ONCE
+            _tile_loadd(TMM2, A_typed[k].qs, lda);
+
+            // ========== GATE PROJECTION ==========
+            const char* B_gate_k = B_gate_nb + PACKED_INDEX(0, k, KB, TILE_SIZE);
+
+            if (need_unpack) {
+                unpack_B<TB>(tile_buf, B_gate_k);
+                _tile_loadd(TMM0, tile_buf, TILE_N * VNNI_BLK);
+            } else {
+                _tile_loadd(TMM0, B_gate_k, TILE_N * VNNI_BLK);
+            }
+
+            // Accumulate gate (using TMM2)
+            _tile_dpbssd(TMM4, TMM2, TMM0);
+
+            // ========== UP PROJECTION (reuse TMM2!) ==========
+            const char* B_up_k = B_up_nb + PACKED_INDEX(0, k, KB, TILE_SIZE);
+
+            if (need_unpack) {
+                unpack_B<TB>(tile_buf, B_up_k);
+                _tile_loadd(TMM0, tile_buf, TILE_N * VNNI_BLK);
+            } else {
+                _tile_loadd(TMM0, B_up_k, TILE_N * VNNI_BLK);
+            }
+
+            // Accumulate up (STILL using TMM2!)
+            _tile_dpbssd(TMM6, TMM2, TMM0);
+        }
+
+            // Store accumulators
+            _tile_stored(TMM4, acc_gate, TILE_N * sizeof(int32_t));
+            _tile_stored(TMM6, acc_up, TILE_N * sizeof(int32_t));
+
+            // Dequantize gate and up using existing acc_C template
+            acc_C<TA, TB, false>::apply(
+                gate_tmp + tile_start, TILE_N, acc_gate, A_typed, KB, B_gate_nb, TILE_M_LOCAL);
+            acc_C<TA, TB, false>::apply(
+                up_tmp + tile_start, TILE_N, acc_up, A_typed, KB, B_up_nb, TILE_M_LOCAL);
+
+            // DEBUG: Check dequantized values
+            static int debug_counter = 0;
+            if (nb == 0 && tile_idx == 0 && debug_counter++ < 3) {
+                fprintf(stderr, "[FUSED] gate_tmp[0:4]: %.6f %.6f %.6f %.6f\n",
+                    gate_tmp[tile_start], gate_tmp[tile_start+1], gate_tmp[tile_start+2], gate_tmp[tile_start+3]);
+                fprintf(stderr, "[FUSED] up_tmp[0:4]: %.6f %.6f %.6f %.6f\n",
+                    up_tmp[tile_start], up_tmp[tile_start+1], up_tmp[tile_start+2], up_tmp[tile_start+3]);
+            }
+        }  // end tile_idx loop
+    }  // end nb loop
+
+    // ========== INLINE SILU FUSION ==========
+    // Use existing fused_silu_mul_batch_avx512 for SiLU fusion
+    // This is more maintainable than reimplementing exp()
+    fused_silu_mul_batch_avx512(gate_tmp, up_tmp, C_intermediate, 1, N);
+}
+
 // Buffer pool for AMX Fused Gate+Up+SiLU MoE operations
 // Thread-local buffer reuse reduces allocation overhead in steady state
 struct amx_fused_moe_buffer_pool {
@@ -3449,36 +3572,26 @@ void ggml_backend_amx_mul_mat_gate_up_silu_fused(
 
         // Step 2 & 3: Gate and Up projections using AMX tiles
         // Use row-wise processing for very small M (M <= 2) to reduce overhead (decode optimization)
-        if (M <= 2) {
-            // Row-wise kernel: lower overhead for decode (M=1 or M=2)
-            // tinygemm_kernel_amx requires N == 2*TILE_N = 32
+        if (M <= 2 && false) {  // TEMPORARILY DISABLED TO TEST BASELINE
+            // AMX Native Fused Kernel - DO NOT REVERT TO BASELINE
             ggml_tile_config_init();
-            constexpr int N_BLOCK = 2 * TILE_N;  // 32 - required by tinygemm_kernel_amx
-            const int NB_count = N / N_BLOCK;    // For N=768: 768/32 = 24 blocks
 
             for (int m = 0; m < M; ++m) {
                 const char * a_row = quantized_input_buffer + m * row_size_A;
-                float * gate_out_row = gate_output_buffer + m * N;
-                float * up_out_row = up_output_buffer + m * N;
 
-                for (int nb = 0; nb < NB_count; ++nb) {
-                    const int nb_start = nb * N_BLOCK;
-
-                    // Gate projection - M=1, N=32 (2*TILE_N)
-                    tinygemm_kernel_amx<vec_dot_type, type, float, blck_size>(
-                        1, N_BLOCK, KB,  // M=1, N=32
-                        a_row,
-                        (const char *)gate_expert_weights + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
-                        gate_out_row + nb_start, N);
-
-                    // Up projection - M=1, N=32 (2*TILE_N)
-                    tinygemm_kernel_amx<vec_dot_type, type, float, blck_size>(
-                        1, N_BLOCK, KB,  // M=1, N=32
-                        a_row,
-                        (const char *)up_expert_weights + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
-                        up_out_row + nb_start, N);
-                }
+                // Call fused kernel
+                amx_fused_gate_up_silu_kernel_m1<vec_dot_type, type>(
+                    N, KB, a_row,
+                    gate_expert_weights, up_expert_weights,
+                    gate_output_buffer + m * N,
+                    up_output_buffer + m * N,
+                    intermediate_buffer + m * N,
+                    TILE_SIZE
+                );
             }
+
+            // Skip separate SiLU fusion - already done in kernel
+            goto skip_separate_silu_fusion;
         } else {
             // Tile-based kernel: better for larger M (prefill optimization)
             const int MB = div_up(M, BLOCK_M);
@@ -3523,12 +3636,14 @@ void ggml_backend_amx_mul_mat_gate_up_silu_fused(
         // Step 4: Fused SiLU activation + element-wise multiply
         // intermediate[i] = silu(gate[i]) * up[i]
         // Uses vectorized AVX-512 implementation (16 floats at a time)
+        // NOTE: Skipped when M<=2 uses AMX native fused kernel (SiLU already applied inline)
         fused_silu_mul_batch_avx512(
             gate_output_buffer,     // [M, N]
             up_output_buffer,       // [M, N]
             intermediate_buffer,    // [M, N]
             M, N);
 
+skip_separate_silu_fusion:
         // DEBUG: Print intermediate values for ALL experts (first call only)
         static int debug_count = 0;
         if (debug_count < 3 && M > 0) {
