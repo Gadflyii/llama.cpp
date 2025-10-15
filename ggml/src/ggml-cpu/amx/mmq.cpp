@@ -2836,13 +2836,15 @@ size_t ggml_backend_amx_get_alloc_size(const struct ggml_tensor * tensor) {
 
     const int K = tensor->ne[0]; // ne0: in_features
     const int N = tensor->ne[1]; // ne1: out_features
+    const int64_t n_experts = (tensor->ne[2] > 1) ? tensor->ne[2] : 1;  // MoE expert dimension
 
     auto get_tensor_size = [&] {
         size_t row_size_B{0};
         GGML_DISPATCH_QTYPES(TYPE, [&] {
             row_size_B = get_row_size<type, blck_size>(K);
         });
-        return N * row_size_B;
+        // CRITICAL FIX: Multiply by number of experts for MoE tensors
+        return n_experts * N * row_size_B;
     };
 
     if (qtype_has_amx_kernels(TYPE)) {
@@ -2861,9 +2863,11 @@ void ggml_backend_amx_convert_weight(struct ggml_tensor * tensor, const void * d
 
     const int K = tensor->ne[0]; // ne0: in_features
     const int N = tensor->ne[1]; // ne1: out_features
+    const int64_t n_experts = (tensor->ne[2] > 1) ? tensor->ne[2] : 1;  // MoE expert dimension
 
     GGML_DISPATCH_QTYPES(TYPE, [&] {
-        convert_B_packed_format<type, blck_size>((void *)((char *)tensor->data + offset), (const type *)data, N, K);
+        // CRITICAL FIX: For MoE tensors, convert N * n_experts total rows (all experts)
+        convert_B_packed_format<type, blck_size>((void *)((char *)tensor->data + offset), (const type *)data, N * n_experts, K);
     });
 
     // NUMA weight replication for MoE experts
