@@ -1886,10 +1886,8 @@ template<typename TB, int BLOCK_K>
 void convert_B_packed_format(void * RESTRICT packed_B, const TB * RESTRICT B, int N, int K) {
     const int NB = N / TILE_N;
     const int KB = K / BLOCK_K;
-    // CRITICAL FIX: Use AMX packed tile size (64 bytes), not original format tile size (288 bytes)
-    // AMX packed format: each tile is TILE_N * VNNI_BLK = 16 * 4 = 64 bytes (INT8 VNNI format)
-    // Original Q4_0 format: each tile would be TILE_N * sizeof(block_q4_0) = 16 * 18 = 288 bytes
-    const int TILE_SIZE = TILE_N * VNNI_BLK;  // 64 bytes for AMX packed format
+    // REVERT: Use original tile size calculation
+    const int TILE_SIZE = get_tile_size<TB>();
 
     // parallel on NB should be enough
     parallel_for(NB, [&](int begin, int end) {
@@ -2844,12 +2842,9 @@ size_t ggml_backend_amx_get_alloc_size(const struct ggml_tensor * tensor) {
     auto get_tensor_size = [&] {
         size_t row_size_B{0};
         GGML_DISPATCH_QTYPES(TYPE, [&] {
-            // CRITICAL FIX: Use AMX packed row size, not original format size
-            // AMX packed format: row_size = (K / blck_size) * TILE_N * VNNI_BLK
-            const int KB = K / blck_size;
-            row_size_B = KB * TILE_N * VNNI_BLK;  // AMX packed row size (64 bytes per tile)
+            row_size_B = get_row_size<type, blck_size>(K);
         });
-        // CRITICAL FIX: Multiply by number of experts for MoE tensors
+        // Multiply by number of experts for MoE tensors
         return n_experts * N * row_size_B;
     };
 
@@ -2872,19 +2867,16 @@ void ggml_backend_amx_convert_weight(struct ggml_tensor * tensor, const void * d
     const int64_t n_experts = (tensor->ne[2] > 1) ? tensor->ne[2] : 1;  // MoE expert dimension
 
     GGML_DISPATCH_QTYPES(TYPE, [&] {
-        // CRITICAL FIX: For MoE tensors, convert N * n_experts total rows (all experts)
+        // For MoE tensors, convert N * n_experts total rows (all experts)
         convert_B_packed_format<type, blck_size>((void *)((char *)tensor->data + offset), (const type *)data, N * n_experts, K);
 
-        // CRITICAL FIX: Update nb[2] stride to reflect AMX packed format
-        // AMX packing changes the stride between experts
-        // AMX packed format: row_size = (K / blck_size) * TILE_N * VNNI_BLK
-        // For Q4_0 with K=2048: (2048/32) * 16 * 4 = 64 * 64 = 4096 bytes/row
+        // CRITICAL: Update nb[2] stride for MoE tensors after AMX packing
+        // AMX packing changes the data layout, so the stride between experts changes
         if (n_experts > 1) {
-            const int KB = K / blck_size;
-            const size_t row_size_B = KB * TILE_N * VNNI_BLK;  // AMX packed row size (use macros from common.h)
-            tensor->nb[2] = N * row_size_B;  // New packed stride per expert
-            fprintf(stderr, "[AMX] Updated MoE tensor stride: KB=%d, row_size=%zu, stride=%zu bytes per expert (N=%d)\n",
-                    KB, row_size_B, tensor->nb[2], N);
+            const size_t row_size_B = get_row_size<type, blck_size>(K);
+            tensor->nb[2] = N * row_size_B;  // Packed stride per expert
+            fprintf(stderr, "[AMX] Updated MoE expert stride: nb[2]=%zu bytes (N=%d, row_size=%zu)\n",
+                    tensor->nb[2], N, row_size_B);
         }
     });
 
@@ -3284,7 +3276,7 @@ void ggml_backend_amx_mul_mat_moe_expert(
                     tinygemm_kernel_amx<vec_dot_type, type, float, blck_size>(
                         1, nb_size, KB,  // M=1 for row kernel
                         a_row,
-                        (const char *)expert_weights + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
+                        (const char *)expert_weights + PACKED_INDEX(nb, 0, KB, TILE_SIZE),
                         out_row + nb_start, N);
                 }
             }

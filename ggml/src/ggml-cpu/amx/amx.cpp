@@ -271,10 +271,10 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
     }
 
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
-        // MOE and FUSED_MOE: Check if this is an MoE expert gate/up weight during model loading
-        // This runs BEFORE the operation is built, so we detect by tensor name
+        // Only FUSED_MOE uses AMX buffer for MoE expert weights
+        // BASE and MOE keep expert weights in CPU_REPACK buffer
         const enum ggml_amx_moe_arch arch = ggml_get_amx_moe_arch();
-        if (arch == GGML_AMX_MOE_ARCH_MOE || arch == GGML_AMX_MOE_ARCH_FUSED_MOE) {
+        if (arch == GGML_AMX_MOE_ARCH_FUSED_MOE) {
             // Check src[0] (weight tensor) - during model loading, dummy ops are created to test buffer support
             if (op->src[0]) {
                 if (is_moe_expert_gate_or_up_weight(op->src[0])) {
@@ -282,8 +282,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                         static bool first_detection = true;
                         if (first_detection) {
                             fprintf(stderr, "[AMX BUFFER] ✓ Detected MoE expert gate/up weight: %s\n", op->src[0]->name);
-                            fprintf(stderr, "[AMX BUFFER] ✓ Selecting AMX buffer for %s architecture\n",
-                                    arch == GGML_AMX_MOE_ARCH_MOE ? "moe (hybrid)" : "fused_moe");
+                            fprintf(stderr, "[AMX BUFFER] ✓ Selecting AMX buffer for fused_moe architecture\n");
                             first_detection = false;
                         }
                         return true;  // Use AMX buffer for this weight
