@@ -2543,7 +2543,8 @@ template <typename TA, typename TB, typename TC, int BLOCK_K,
           typename std::enable_if<!is_type_qkk<TB>::value, int>::type = 0>
 void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const void * RESTRICT _B, TC * RESTRICT C, int ldc) {
     using packed_B_t = packed_B_type<TB>;
-    const int TILE_SIZE = get_tile_size<TB>();
+    // CRITICAL: Use AMX packed tile size for weight access
+    const int TILE_SIZE = TILE_N * VNNI_BLK;  // 64 bytes for AMX packed format
     const bool need_unpack = do_unpack<TB>::value;
 
     // Get prefetch distance (architecture-dependent: BASE=0, MOE+=1)
@@ -2730,7 +2731,8 @@ template <typename TA, typename TB, typename TC, int BLOCK_K,
           typename std::enable_if<is_type_qkk<TB>::value, int>::type = 0>
 void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const void * RESTRICT _B, float * RESTRICT C, int ldc) {
     static_assert(std::is_same<TA, block_q8_K>::value);
-    const int TILE_SIZE = get_tile_size<TB>();
+    // CRITICAL: Use AMX packed tile size for weight access
+    const int TILE_SIZE = TILE_N * VNNI_BLK;  // 64 bytes for AMX packed format
 
     // Get prefetch distance (architecture-dependent: BASE=0, MOE+=1)
     const int prefetch_distance = get_prefetch_distance();
@@ -3046,7 +3048,8 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
         parallel_for_ggml(params, NB, [&](int begin, int end) {
             GGML_DISPATCH_QTYPES(TYPE, [&] {
                 const int KB = K / blck_size;
-                const int TILE_SIZE = get_tile_size<type>();
+                // CRITICAL: Use AMX packed tile size, not original format tile size
+                const int TILE_SIZE = TILE_N * VNNI_BLK;  // 64 bytes for AMX packed format
                 const int row_size_A = KB * sizeof(vec_dot_type);
                 for (int i = begin; i < end; ++i) {
                     int nb = i;
@@ -3078,7 +3081,8 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
         parallel_for_ggml(params, M * NB, [&](int begin, int end) {
             GGML_DISPATCH_QTYPES(TYPE, [&] {
                 const int KB = K / blck_size;
-                const int TILE_SIZE = get_tile_size<type>();
+                // CRITICAL: Use AMX packed tile size, not original format tile size
+                const int TILE_SIZE = TILE_N * VNNI_BLK;  // 64 bytes for AMX packed format
                 const int row_size_A = KB * sizeof(vec_dot_type);
                 for (int idx = begin; idx < end; ++idx) {
                     int m = idx / NB;  // row index
@@ -3112,7 +3116,8 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
 
         GGML_DISPATCH_QTYPES(TYPE, [&] {
             const int KB = K / blck_size;
-            const int TILE_SIZE = get_tile_size<type>();
+            // CRITICAL: Use AMX packed tile size, not original format tile size
+            const int TILE_SIZE = TILE_N * VNNI_BLK;  // 64 bytes for AMX packed format
             const int row_size_A = KB * sizeof(vec_dot_type);
 
             for (int i = begin; i < end; ++i) {
@@ -3263,7 +3268,8 @@ void ggml_backend_amx_mul_mat_moe_expert(
         constexpr int BLOCK_M = TILE_M * 2;
         constexpr int BLOCK_N = TILE_N * 2;
         const int KB = K / blck_size;
-        const int TILE_SIZE = get_tile_size<type>();
+        // CRITICAL: Use AMX packed tile size for weight access
+        const int TILE_SIZE = TILE_N * VNNI_BLK;  // 64 bytes for AMX packed format
 
         // Use row-wise processing for very small M (M <= 2) to reduce overhead
         // This is common in decode (token-by-token generation)
@@ -3590,7 +3596,8 @@ void ggml_backend_amx_mul_mat_gate_up_silu_fused(
         constexpr int BLOCK_M = TILE_M * 2;
         constexpr int BLOCK_N = TILE_N * 2;
         const int KB = K / blck_size;
-        const int TILE_SIZE = get_tile_size<type>();
+        // CRITICAL: Use AMX packed tile size for weight access
+        const int TILE_SIZE = TILE_N * VNNI_BLK;  // 64 bytes for AMX packed format
 
         // Step 2 & 3: Gate and Up projections using AMX tiles
         // Use row-wise processing for very small M (M <= 2) to reduce overhead (decode optimization)
@@ -3856,7 +3863,8 @@ void ggml_backend_amx_mul_mat_moe_batch(
             ggml_tile_config_init();
 
             const int KB = K / blck_size;
-            const int TILE_SIZE = get_tile_size<type>();
+            // CRITICAL: Use AMX packed tile size for weight access
+            const int TILE_SIZE = TILE_N * VNNI_BLK;  // 64 bytes for AMX packed format
             const int row_size_A_local = KB * sizeof(vec_dot_type);
 
             for (int work_idx = begin; work_idx < end; ++work_idx) {
